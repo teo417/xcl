@@ -7523,6 +7523,45 @@ fn gpu_compute_tg_size_counts_a_partial_last_wave() {
     }
 }
 
+/// A dispatch of more groups in X than D3D12 takes, folded into Y (`IO_GROUP_LIMIT`): each of
+/// the console's groups runs once with its own id in X, none past its count; with no count in io
+/// the groups are the dispatch's own (a retail game's 72 512 × 1 × 1 hung the GPU unfolded).
+#[test]
+fn gpu_compute_folded_dispatch_runs_each_console_group_once() {
+    if !gpu_ready() {
+        return;
+    }
+    // global_store_dword [s2 * 4], s2 (s2: the group id in X after user SGPRs s0, s1)
+    let p = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 2)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 130), ("VSRC1", 4)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 4), ("SADDR", 0x7D)], None),
+    ]);
+    let fold = super::FOLD_X;
+    for wave64 in [false, true] {
+        let cs = super::CsInterface { threads: [1, 1, 1], user_sgprs: 2, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+        let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(cs), wave64, ..Default::default() })).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        for n in [72_512u32, fold + 1] {
+            let rows = n.div_ceil(fold);
+            let mut io = vec![0u32; 128];
+            io[super::IO_GROUP_LIMIT] = n;
+            let mem = runner::dispatch(&dxil, [fold, rows, 1], &io, &vec![0xFFFF_FFFFu32; (fold * rows) as usize]).unwrap();
+            for (k, &got) in mem.iter().enumerate() {
+                let want = if (k as u32) < n { k as u32 } else { 0xFFFF_FFFF };
+                assert_eq!(got, want, "wave64 {wave64}: {n} groups folded into {fold} x {rows}, group {k}");
+            }
+        }
+        // not folded: the dispatch's own groups (Y left alone)
+        let mem = runner::dispatch(&dxil, [100, 1, 1], &[0u32; 128], &vec![0xFFFF_FFFFu32; 128]).unwrap();
+        for (k, &got) in mem.iter().enumerate() {
+            assert_eq!(got, if k < 100 { k as u32 } else { 0xFFFF_FFFF }, "wave64 {wave64}: unfolded group {k}");
+        }
+    }
+}
+
 /// v_fract_f32 at the edges, as RDNA computes it (x - floor(x) kept below 1.0): ±inf gives
 /// NaN and a NaN stays NaN – a `min()` clamp returned 0.99999994 there on NVIDIA (HLSL min
 /// returns its non-NaN operand); a tiny negative value rounds to the largest float below 1.

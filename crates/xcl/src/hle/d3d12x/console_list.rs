@@ -929,6 +929,9 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         };
                         io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
                         io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
+                        // more groups in X than D3D12 takes: folded (`recomp::IO_GROUP_LIMIT`)
+                        let (limit, [x, y, z]) = super::bind::fold(x, y, z);
+                        io[crate::gpu::recomp::IO_GROUP_LIMIT] = limit;
                         let io_at = uma_copy(st, bytemuck_u32(&io)).ok_or("UMA: io")?;
                         let res_at = uma_copy(st, &[0u8; 256]).ok_or("UMA: res")?;
                         // the pipeline's own root signature when it has static samplers

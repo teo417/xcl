@@ -533,6 +533,14 @@ fn transition(r: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RE
 }
 
 /// Name of the GPU the kernels run on (None: no usable GPU).
+/// The tests' device (with the Agility SDK when there is one): a test that makes its own device
+/// first leaves the SDK unappliable for the process (0x887E0003), and the GPU tests after it skip.
+pub fn device() -> Result<ID3D12Device, String> {
+    let mut g = GPU.lock().unwrap();
+    let gpu = g.get_or_insert_with(init);
+    gpu.as_ref().map(|x| x.dev.clone()).map_err(|x| x.clone())
+}
+
 pub fn adapter() -> Result<String, String> {
     let mut g = GPU.lock().unwrap();
     let gpu = g.get_or_insert_with(init);

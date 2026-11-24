@@ -983,11 +983,15 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             }
         }
     }
-    match bind_abi(this, list, pso, gfx) {
-        Ok(()) => {
+    match bind_abi(this, list, pso, gfx, 0) {
+        Ok(mut b) => {
             if compute {
                 match super::real::dispatch_chain::whole(pso) {
-                    Ok(Some(whole)) => list.SetPipelineState(&whole),
+                    Ok(Some(whole)) => {
+                        list.SetPipelineState(&whole);
+                        // the binding set again after the clamp pass keeps the whole form
+                        b.pso = whole.clone();
+                    }
                     Ok(None) => {}
                     Err(e) => {
                         crate::xlog_warn!("D3D12.X: ExecuteIndirect whole compute PSO: {e}");
@@ -1002,8 +1006,22 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             let at = super::real::console_buffer(args)
                 .filter(|&(_, size)| args_off_title as usize + 12 <= size)
                 .map_or(0, |(p, _)| p + args_off_title as usize);
+            // one dispatch: its group counts folded or clamped on the GPU first (`clamp`, which
+            // writes a folded count into this dispatch's io), then the binding set again
+            let (mut args, mut args_off) = (args, args_off);
+            let mut clamped = None;
+            if !gfx && max == 1 {
+                clamped = super::clamp::before(list, args, args_off, b.io + 4 * crate::gpu::recomp::IO_GROUP_LIMIT as u64);
+                if let Some((a, o)) = clamped {
+                    (args, args_off) = (a, o);
+                    rebind(list, &b, false);
+                }
+            }
             let _crumb = super::crumbs::begin(list, pso, super::crumbs::Groups::Indirect(at));
-            fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off))
+            fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
+            if clamped.is_some() {
+                super::clamp::done(list);
+            }
         }
         Err(e) => {
             if gfx {
@@ -1050,7 +1068,7 @@ unsafe fn chained_indirect(this: *mut c_void, list: &ID3D12GraphicsCommandList, 
         .map_or(0, |(p, _)| p + args_title as usize);
     let _crumb = super::crumbs::begin(list, pso, super::crumbs::Groups::Indirect(at));
     super::real::dispatch_chain::execute_indirect(list, pso, with(this, |s| s.allocator), args_va, stride, max, count_va, &seen,
-        super::list_x::predicated(this), || bind_abi(this, list, pso, false))
+        super::list_x::predicated(this), || bind_abi(this, list, pso, false, 0).map(|_| ()))
 }
 
 /// The GPU address of a title's buffer `res` at its offset `title` (a buffer in unified memory) or
@@ -1298,8 +1316,8 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
     if super::present::trace_frame() {
         trace_ui_draw(this, pso);
     }
-    match bind_abi(this, &list, pso, true) {
-        Ok(()) => {
+    match bind_abi(this, &list, pso, true, 0) {
+        Ok(_) => {
             count(DRAWS);
             Some(list)
         }
@@ -1718,7 +1736,9 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     if super::present::trace_frame() {
         trace_fullscreen(this, pso, [x, y, z]);
     }
-    bind_abi(this, list, pso, false)?;
+    // more groups in X than D3D12 takes: folded (`recomp::IO_GROUP_LIMIT`)
+    let (limit, folded) = fold(x, y, z);
+    bind_abi(this, list, pso, false, limit)?;
     let cat = if super::real::dispatch_chain::is_chain(pso) {
         super::gpu_timing::Cat::Chain
     } else {
@@ -1726,13 +1746,57 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     };
     let _cat = super::gpu_timing::CatScope::begin(list, cat);
     let _crumb = super::crumbs::begin(list, pso, super::crumbs::Groups::Direct([x, y, z]));
-    super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), [x, y, z])
+    super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), folded)
+}
+
+/// A dispatch of `x` × `y` × `z` groups as D3D12 takes it: (the count for
+/// `recomp::IO_GROUP_LIMIT` – 0: not folded –, the groups to dispatch). More than 65 535 in X
+/// with 1 in Y is folded into Y; any other count past 65 535 is clamped (logged once).
+pub(super) fn fold(x: u32, y: u32, z: u32) -> (u32, [u32; 3]) {
+    use crate::gpu::recomp::FOLD_X;
+    if x <= FOLD_X && y <= 65_535 && z <= 65_535 {
+        return (0, [x, y, z]);
+    }
+    if y == 1 && z <= 65_535 && x.div_ceil(FOLD_X) <= 65_535 {
+        return (x, [FOLD_X, x.div_ceil(FOLD_X), z]);
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 4 {
+        crate::xlog_warn!("D3D12.X: a dispatch of {x}x{y}x{z} groups cannot be folded – clamped to 65535 a dimension");
+    }
+    (0, [x.min(65_535), y.min(65_535), z.min(65_535)])
+}
+
+/// What `bind_abi` set on a list, for setting it again after other work in between (`rebind`)
+/// and the GPU address of its `io`.
+pub(super) struct Bound {
+    rs: ID3D12RootSignature,
+    views: [u64; 6],
+    pso: ID3D12PipelineState,
+    pub io: u64,
+}
+
+/// The binding `bind_abi` made, set on `list` again.
+pub(super) unsafe fn rebind(list: &ID3D12GraphicsCommandList, b: &Bound, gfx: bool) {
+    if gfx {
+        list.SetGraphicsRootSignature(&b.rs);
+        for (k, v) in b.views.iter().enumerate() {
+            list.SetGraphicsRootUnorderedAccessView(k as u32, *v);
+        }
+    } else {
+        list.SetComputeRootSignature(&b.rs);
+        for (k, v) in b.views.iter().enumerate() {
+            list.SetComputeRootUnorderedAccessView(k as u32, *v);
+        }
+    }
+    list.SetPipelineState(&b.pso);
 }
 
 /// XCL's ABI for a translated pipeline: its root signature, the user SGPRs (`io`, the kept
 /// arguments the console's way – compute or graphics) and the argument table in unified
-/// memory, u1 res, u2… the memory windows; then the pipeline.
-unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool) -> Result<(), String> {
+/// memory, u1 res, u2… the memory windows; then the pipeline. `group_limit`: a folded
+/// dispatch's group count in X (`recomp::IO_GROUP_LIMIT`), 0 for any other.
+unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool, group_limit: u32) -> Result<Bound, String> {
     super::list_x::ensure_view_heap(this);
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let windows = super::real::uma_window_vas();
@@ -1757,28 +1821,24 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     };
     io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
     io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
+    io[crate::gpu::recomp::IO_GROUP_LIMIT] = group_limit;
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
     let res_at = copy(&[0u8; 256])?;
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
     let rs = super::real::pso_root_signature(real).or_else(|| super::real::abi_rs_cached().map(|p| p as usize)).ok_or("no XCL ABI root signature")?;
     let rs = rs as *mut c_void;
-    let rs = ID3D12RootSignature::from_raw_borrowed(&rs).ok_or("root signature")?;
-    let views = [va(io_at), va(res_at)].into_iter().chain((0..4).map(|k| windows.get(k).copied().filter(|&v| v != 0).unwrap_or(first)));
-    if gfx {
-        list.SetGraphicsRootSignature(rs);
-        for (k, v) in views.enumerate() {
-            list.SetGraphicsRootUnorderedAccessView(k as u32, v);
-        }
-    } else {
-        list.SetComputeRootSignature(rs);
-        for (k, v) in views.enumerate() {
-            list.SetComputeRootUnorderedAccessView(k as u32, v);
-        }
+    let rs = ID3D12RootSignature::from_raw_borrowed(&rs).ok_or("root signature")?.clone();
+    let mut views = [first; 6];
+    views[0] = va(io_at);
+    views[1] = va(res_at);
+    for k in 0..4 {
+        views[2 + k] = windows.get(k).copied().filter(|&v| v != 0).unwrap_or(first);
     }
     let real = real as *mut c_void;
-    let pc = ID3D12PipelineState::from_raw_borrowed(&real).ok_or("pipeline")?;
-    list.SetPipelineState(pc);
-    Ok(())
+    let pc = ID3D12PipelineState::from_raw_borrowed(&real).ok_or("pipeline")?.clone();
+    let b = Bound { rs, views, pso: pc, io: views[0] };
+    rebind(list, &b, gfx);
+    Ok(b)
 }
 
 #[cfg(test)]
@@ -1827,6 +1887,24 @@ mod tests {
     use super::super::{device_x, list_x, pso_async, real, title_list};
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    /// Counts D3D12 takes are dispatched as they are; more than 65 535 in X with 1 in Y are
+    /// folded into Y with the console's count kept (a retail game's 72 512 × 1 × 1); others past
+    /// the limit are clamped.
+    #[test]
+    fn dispatches_past_the_d3d12_limit_are_folded_or_clamped() {
+        assert_eq!(fold(64, 2, 1), (0, [64, 2, 1]));
+        assert_eq!(fold(65_535, 1, 1), (0, [65_535, 1, 1]));
+        assert_eq!(fold(72_512, 1, 1), (72_512, [65_535, 2, 1]));
+        assert_eq!(fold(131_071, 1, 3), (131_071, [65_535, 3, 3]));
+        assert_eq!(fold(70_000, 2, 1), (0, [65_535, 2, 1]), "two dimensions in use: clamped");
+        // every console group is in the folded grid exactly once, and no more than 65 535 more
+        for n in [65_536u32, 72_512, 75_072, 200_000] {
+            let (limit, [x, y, _]) = fold(n, 1, 1);
+            assert_eq!(limit, n);
+            assert!(x * y >= n && x * y - n < x, "{n}: {x}x{y}");
+        }
+    }
 
     /// A pipeline with the rect list GS draws its rect lists whole: draw_rects leaves them alone.
     #[test]

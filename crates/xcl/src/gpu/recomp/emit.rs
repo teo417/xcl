@@ -5023,12 +5023,20 @@ impl Em {
                     h.push_str("    lane_id = WaveGetLaneIndex();\n");
                 }
                 load_sgprs(&mut h);
+                // a folded dispatch (`IO_GROUP_LIMIT`): the console's group in X, the groups
+                // past its count left out (the whole group returns)
+                let _ = writeln!(
+                    h,
+                    "    uint3 xcl_gid = gid;\n    {{\n        uint xcl_gl = io.Load({}u);\n        if (xcl_gl != 0u) {{\n            uint xcl_f = gid.x + gid.y * {}u;\n            if (xcl_f >= xcl_gl) return;\n            xcl_gid = uint3(xcl_f, 0u, gid.z);\n        }}\n    }}",
+                    super::IO_GROUP_LIMIT * 4,
+                    super::FOLD_X
+                );
                 // system SGPRs after the user data: enabled group ids, then TG_SIZE
                 let mut next = cs.user_sgprs as u64;
                 for (k, c) in ["x", "y", "z"].iter().enumerate() {
                     if cs.tgid[k] {
                         if sg.contains(&next) {
-                            let _ = writeln!(h, "    {} = gid.{c};", sname(next).unwrap());
+                            let _ = writeln!(h, "    {} = xcl_gid.{c};", sname(next).unwrap());
                         }
                         next += 1;
                     }

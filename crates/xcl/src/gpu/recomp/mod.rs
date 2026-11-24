@@ -204,6 +204,14 @@ pub const GS_PRIMS_PER_GROUP: u32 = 21;
 pub const IO_GS_PRIMS: usize = 110;
 pub const IO_GS_VERTICES: usize = 111;
 pub const IO_UMA_BASE_HI: usize = 112;
+/// io slot (trap-temp range) of a compute dispatch whose groups were folded: the console's group
+/// count in X, 0 when not folded. The console takes up to 2^32 − 1 groups a dimension, D3D12
+/// 65 535 – a dispatch of more in X (and 1 in Y) runs as 65 535 × ⌈n / 65 535⌉ groups, and
+/// the translated program takes `gid.x + gid.y · 65 535` as its group in X, leaving out the
+/// groups at or past `n` (a retail game's 72 512 × 1 × 1 hung the GPU).
+pub const IO_GROUP_LIMIT: usize = 113;
+/// Groups a folded dispatch has in X.
+pub const FOLD_X: u32 = 65_535;
 
 impl GsInterface {
     /// bytes of one ES vertex in LDS (ESGS item: 16 per ES output register)

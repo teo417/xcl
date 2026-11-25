@@ -196,6 +196,15 @@ pub(super) fn layout_of(rs: usize) -> Option<Arc<Layout>> {
     LAYOUTS.lock().unwrap().as_ref()?.get(&rs).cloned()
 }
 
+/// Both are the layout of the same root signature object (not merely of one at a freed address).
+pub(super) fn same_layout(a: &Option<Arc<Layout>>, b: &Option<Arc<Layout>>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // pipeline states
 // ---------------------------------------------------------------------------------------
@@ -770,8 +779,11 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                 at += 7;
             } else if w0 == RS_MARKER {
                 let r = get(2) as usize | (get(3) as usize) << 32;
-                layout = layout_of(r);
-                table = vec![0u8; layout.as_ref().map_or(0, |l| l.size as usize)];
+                let new = layout_of(r);
+                if !same_layout(&layout, &new) {
+                    table = vec![0u8; new.as_ref().map_or(0, |l| l.size as usize)];
+                }
+                layout = new;
                 at += 4;
             } else if w0 == HEAPS_MARKER {
                 let n = get(1) as usize;

@@ -4476,8 +4476,7 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
     }
     let reused = hr >= 0 && cached.is_some() && copy.CachedPSO.CachedBlobSizeInBytes != 0;
     if hr >= 0 && !reused {
-        keep_compute_blob(key, *ppv, dxil.len());
-        if let (Some(p), Some(b)) = (disk.as_deref(), compute_blob(key)) {
+        if let (Some(p), Some(b)) = (disk.as_deref(), keep_compute_blob(key, *ppv, dxil.len())) {
             driver_cache::keep(p, &b, in_driver);
         }
     } else if reused && from_disk {
@@ -4786,6 +4785,28 @@ mod compute_blob_tests {
         assert!(super::compute_blob(key).is_none());
         assert_eq!(super::COMPUTE_BLOBS.lock().unwrap().as_ref().unwrap().1, before - 3);
     }
+
+    #[test]
+    fn blobs_over_the_memory_budget_still_reach_their_caller() {
+        let mut cstore = (super::HashMap::new(), 0usize);
+        let fits = super::remember_blob(&mut cstore, super::COMPUTE_BLOBS_MAX, (1u64, 2usize, 0i32), vec![7u8; 64]).expect("blob that fits");
+        assert_eq!(fits.len(), 64);
+        assert_eq!(cstore.1, 64);
+        assert!(cstore.0.contains_key(&(1, 2, 0)));
+
+        cstore.1 = super::COMPUTE_BLOBS_MAX;
+        let over = super::remember_blob(&mut cstore, super::COMPUTE_BLOBS_MAX, (3, 4, 0), vec![9u8; 128]);
+        assert!(!cstore.0.contains_key(&(3, 4, 0)));
+        assert_eq!(cstore.1, super::COMPUTE_BLOBS_MAX, "unkept blob must not charge budget");
+        assert_eq!(over.expect("blob for disk cache").as_slice(), &[9u8; 128][..]);
+        assert!(super::remember_blob(&mut cstore, super::COMPUTE_BLOBS_MAX, (5, 6, 0), Vec::new()).is_none());
+
+        let mut gstore = (super::HashMap::new(), super::GRAPHICS_BLOBS_MAX);
+        let gover = super::remember_blob(&mut gstore, super::GRAPHICS_BLOBS_MAX, (9u64, 16usize), vec![5u8; 32]);
+        assert!(!gstore.0.contains_key(&(9, 16)));
+        assert_eq!(gstore.1, super::GRAPHICS_BLOBS_MAX);
+        assert_eq!(gover.expect("graphics blob for disk cache").as_slice(), &[5u8; 32][..]);
+    }
 }
 
 /// Read `GetCachedBlob` from either an adopted or raw PC `ID3D12PipelineState`.
@@ -4811,20 +4832,35 @@ unsafe fn read_pso_cached_blob(pso: *mut c_void) -> Option<Vec<u8>> {
     (!bytes.is_empty()).then_some(bytes)
 }
 
+fn remember_blob<K: Eq + std::hash::Hash>(
+    store: &mut (HashMap<K, std::sync::Arc<Vec<u8>>>, usize),
+    limit: usize,
+    key: K,
+    bytes: Vec<u8>,
+) -> Option<std::sync::Arc<Vec<u8>>> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let bytes = std::sync::Arc::new(bytes);
+    if store.1 + bytes.len() <= limit {
+        store.1 += bytes.len();
+        store.0.insert(key, bytes.clone());
+    }
+    Some(bytes)
+}
+
 /// The driver's blob of the PSO just built (works on both adopted title PSOs and raw PC compute
-/// passes owned by `TwoPassPso`).
-unsafe fn keep_compute_blob(key: (u64, usize, i32), pso: *mut c_void, dxil_len: usize) {
-    if dxil_len < COMPUTE_BLOB_MIN_DXIL || pso.is_null() || compute_blob(key).is_some() {
-        return;
+/// passes owned by `TwoPassPso`), returned for the disk cache even when `COMPUTE_BLOBS_MAX` is full.
+unsafe fn keep_compute_blob(key: (u64, usize, i32), pso: *mut c_void, dxil_len: usize) -> Option<std::sync::Arc<Vec<u8>>> {
+    if dxil_len < COMPUTE_BLOB_MIN_DXIL || pso.is_null() {
+        return None;
     }
-    let Some(bytes) = read_pso_cached_blob(pso) else { return };
+    if let Some(b) = compute_blob(key) {
+        return Some(b);
+    }
+    let bytes = read_pso_cached_blob(pso)?;
     let mut g = COMPUTE_BLOBS.lock().unwrap();
-    let (m, total) = g.get_or_insert_with(|| (HashMap::new(), 0));
-    if bytes.is_empty() || *total + bytes.len() > COMPUTE_BLOBS_MAX {
-        return;
-    }
-    *total += bytes.len();
-    m.insert(key, std::sync::Arc::new(bytes));
+    remember_blob(g.get_or_insert_with(|| (HashMap::new(), 0)), COMPUTE_BLOBS_MAX, key, bytes)
 }
 
 /// The driver's compiled form of translated graphics pipelines (`GetCachedBlob`),
@@ -4844,18 +4880,16 @@ fn forget_graphics_blob(key: (u64, usize)) {
     }
 }
 
-unsafe fn keep_graphics_blob(key: (u64, usize), pso: *mut c_void, dxil_len: usize) {
-    if dxil_len < COMPUTE_BLOB_MIN_DXIL || pso.is_null() || graphics_blob(key).is_some() {
-        return;
+unsafe fn keep_graphics_blob(key: (u64, usize), pso: *mut c_void, dxil_len: usize) -> Option<std::sync::Arc<Vec<u8>>> {
+    if dxil_len < COMPUTE_BLOB_MIN_DXIL || pso.is_null() {
+        return None;
     }
-    let Some(bytes) = read_pso_cached_blob(pso) else { return };
+    if let Some(b) = graphics_blob(key) {
+        return Some(b);
+    }
+    let bytes = read_pso_cached_blob(pso)?;
     let mut g = GRAPHICS_BLOBS.lock().unwrap();
-    let (m, total) = g.get_or_insert_with(|| (HashMap::new(), 0));
-    if bytes.is_empty() || *total + bytes.len() > GRAPHICS_BLOBS_MAX {
-        return;
-    }
-    *total += bytes.len();
-    m.insert(key, std::sync::Arc::new(bytes));
+    remember_blob(g.get_or_insert_with(|| (HashMap::new(), 0)), GRAPHICS_BLOBS_MAX, key, bytes)
 }
 
 /// Deterministic FNV-1a digest of every field in a translated PC graphics PSO (shaders, static
@@ -5287,8 +5321,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     );
     let hr = build.hr;
     if build.cache_eligible {
-        keep_graphics_blob(gkey, *ppv, bytes);
-        if let (Some(p), Some(b)) = (disk.as_deref(), graphics_blob(gkey)) {
+        if let (Some(p), Some(b)) = (disk.as_deref(), keep_graphics_blob(gkey, *ppv, bytes)) {
             driver_cache::keep(p, &b, build.in_driver);
         }
     } else if build.reused && from_disk {
@@ -6046,8 +6079,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     }
     let creused = hc >= 0 && ccached.is_some() && cdesc.CachedPSO.CachedBlobSizeInBytes != 0;
     if hc >= 0 && !creused && !compute.is_null() {
-        keep_compute_blob(ckey, compute, tp.cs.len());
-        if let (Some(p), Some(b)) = (cdisk.as_deref(), compute_blob(ckey)) {
+        if let (Some(p), Some(b)) = (cdisk.as_deref(), keep_compute_blob(ckey, compute, tp.cs.len())) {
             driver_cache::keep(p, &b, cin_driver);
         }
     } else if creused && cfrom_disk {

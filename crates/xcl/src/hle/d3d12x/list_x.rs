@@ -1285,6 +1285,31 @@ unsafe fn prune_title_fence(fence_raw: usize, tf: &mut TitleFenceSync) {
 /// involving title `ID3D12Fence` waits/signals) before any cyclic wait-signal pair reaches Vulkan.
 ///
 /// Returns `true` iff emitting `sig_q.Signal` for `(target_va, sig_val)` would close a cycle.
+/// Returns `true` iff a wait on `wait_val` depends on `sig_val` and is not already satisfied
+/// by an earlier signal `covered`.
+#[inline]
+fn wait_depends_on_new_signal(wait_val: u64, sig_val: u64, covered: u64) -> bool {
+    wait_val <= sig_val && wait_val > covered
+}
+
+fn cell_uncovered_waiters(cell: &SyncCell, sig_val: u64) -> Vec<(usize, u64)> {
+    let covered = cell.submitted_max.max(cell.cpu_signaled_max);
+    cell.armed_waits
+        .iter()
+        .filter(|aw| wait_depends_on_new_signal(aw.val, sig_val, covered))
+        .map(|aw| (aw.waiting_queue, aw.wait_seq))
+        .collect()
+}
+
+fn title_fence_uncovered_waiters(tf: &TitleFenceSync, sig_val: u64) -> Vec<(usize, u64)> {
+    let covered = tf.signals.iter().map(|s| s.val).max().unwrap_or(0);
+    tf.waits
+        .iter()
+        .filter(|&&(v, _, _)| wait_depends_on_new_signal(v, sig_val, covered))
+        .map(|&(_, wq, wseq)| (wq, wseq))
+        .collect()
+}
+
 unsafe fn would_signal_close_cycle(graph: &mut SyncGraph, sig_q: usize, target_va: u64, sig_val: u64) -> bool {
     // Prune completed waits/signals on target cell first.
     let target_waiters: Vec<(usize, u64)> = {
@@ -1293,7 +1318,7 @@ unsafe fn would_signal_close_cycle(graph: &mut SyncGraph, sig_q: usize, target_v
         if completed == u64::MAX || target.armed_waits.is_empty() {
             return false;
         }
-        target.armed_waits.iter().filter(|aw| aw.val <= sig_val).map(|aw| (aw.waiting_queue, aw.wait_seq)).collect()
+        cell_uncovered_waiters(target, sig_val)
     };
     if target_waiters.is_empty() {
         return false;
@@ -1432,7 +1457,7 @@ pub(super) unsafe fn break_cycles_before_title_signal(sig_q: usize, title_fence:
         let Some(graph) = g.as_mut() else { return };
         let Some(tf) = graph.title_fences.get_mut(&title_fence) else { return };
         prune_title_fence(title_fence, tf);
-        let target_waiters: Vec<(usize, u64)> = tf.waits.iter().filter(|&&(v, _, _)| v <= sig_val).map(|&(_, wq, wseq)| (wq, wseq)).collect();
+        let target_waiters = title_fence_uncovered_waiters(tf, sig_val);
         if target_waiters.is_empty() {
             return;
         }
@@ -6514,6 +6539,44 @@ mod tests {
             VirtualFree(sparse_va as *mut c_void, 0x1000, MEM_DECOMMIT);
             assert!(uma.sparse_release(sparse_va).is_some());
         }
+    }
+
+    #[test]
+    fn covered_sync_waits_do_not_close_cycles() {
+        let mut cell = SyncCell {
+            submitted_max: 0x6db,
+            cpu_signaled_max: 0,
+            armed_waits: vec![
+                ArmedGpuWait {
+                    val: 0x6db,
+                    waiting_queue: 0xD001,
+                    waiting_queue_ty: D3D12_COMMAND_LIST_TYPE_DIRECT.0,
+                    wait_seq: 3544,
+                    armed_at: Instant::now(),
+                    after_write64: false,
+                },
+                ArmedGpuWait {
+                    val: 0x6dc,
+                    waiting_queue: 0xD001,
+                    waiting_queue_ty: D3D12_COMMAND_LIST_TYPE_DIRECT.0,
+                    wait_seq: 3550,
+                    armed_at: Instant::now(),
+                    after_write64: false,
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(cell_uncovered_waiters(&cell, 0x6dc), vec![(0xD001, 3550)]);
+
+        cell.cpu_signaled_max = 0x6dc;
+        assert!(cell_uncovered_waiters(&cell, 0x6dc).is_empty());
+
+        let mut tf = TitleFenceSync::default();
+        tf.signals.push(SubmittedSignal { val: 1, queue: 0xC0F1, seq: 3 });
+        tf.waits.push((1, 0xC0F0, 5));
+        tf.waits.push((2, 0xC0F0, 6));
+        tf.waits.push((3, 0xC0F0, 7));
+        assert_eq!(title_fence_uncovered_waiters(&tf, 2), vec![(0xC0F0, 6)]);
     }
 
     /// A CPU cycle-break (`SignalAction::CpuCycleBreak` and `break_cycles_before_title_signal`)

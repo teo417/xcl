@@ -482,17 +482,24 @@ unsafe extern "system" fn factory_unknown(_p: *mut c_void) -> HRESULT {
     E_NOTIMPL
 }
 
+/// `DSTORAGE_QUEUE_OPTIONS` bit 0: the queue runs its requests only at `Submit`, not when half full.
+const AUTO_SUBMIT_DISABLED: u64 = 1;
+
 /// Slot 10 of the newer factory: CreateQueue with a 0x20-byte desc – the 0x18 of
-/// `factory_create_queue`, then a u64 (a retail game: 1).
-unsafe extern "system" fn factory_create_queue1(p: *mut c_void, desc: *const u8, riid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+/// `factory_create_queue`, then the queue's options u64 (a retail game: `AutoSubmitDisabled`).
+unsafe extern "system" fn factory_create_queue1(_p: *mut c_void, desc: *const u8, riid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+    let mut options = 0;
     if !desc.is_null() {
-        let extra = (desc.add(0x18) as *const u64).read_unaligned();
+        options = (desc.add(0x18) as *const u64).read_unaligned();
         static SEEN: AtomicBool = AtomicBool::new(false);
         if !SEEN.swap(true, Ordering::Relaxed) {
-            crate::xlog_info!("DirectStorage: CreateQueue (0x20 desc), u64 @0x18 = {extra:#x}");
+            crate::xlog_info!("DirectStorage: CreateQueue (0x20 desc), options {options:#x}");
+        }
+        if options & !AUTO_SUBMIT_DISABLED != 0 {
+            warn_once("DSTORAGE_QUEUE_OPTIONS", format_args!("unknown queue option bits {:#x}", options & !AUTO_SUBMIT_DISABLED));
         }
     }
-    factory_create_queue(p, desc, riid, out)
+    create_queue(desc, riid, out, options & AUTO_SUBMIT_DISABLED == 0)
 }
 
 unsafe extern "system" fn factory_set_cpu_affinity(_p: *mut c_void, _mask: u64) -> HRESULT {
@@ -1073,6 +1080,8 @@ struct QueueInner {
     pool_override: OnceLock<Option<Arc<parallel::DecompressPool>>>,
     #[cfg(test)]
     test_hook: OnceLock<parallel::TestHook>,
+    auto_submit: bool,
+    room: Condvar,
 }
 
 impl QueueInner {
@@ -1103,6 +1112,7 @@ impl QueueInner {
             return;
         }
         let batch = std::mem::take(&mut self.pending.lock().unwrap().entries);
+        self.room.notify_all();
         if batch.is_empty() {
             return;
         }
@@ -1203,9 +1213,18 @@ impl QueueInner {
         }
     }
 
+    /// When `AutoSubmitDisabled` is set on a full queue, block `Enqueue*` until `Submit`,
+    /// `CancelRequestsWithTag`, or `Close` drains entries.
+    fn wait_for_room<'a>(&self, mut p: std::sync::MutexGuard<'a, Pending>) -> std::sync::MutexGuard<'a, Pending> {
+        while !self.auto_submit && p.entries.len() >= self.capacity && !self.closed.load(Ordering::Acquire) {
+            p = self.room.wait(p).unwrap();
+        }
+        p
+    }
+
     fn enqueue(self: &Arc<Self>, e: Entry) {
         let n = {
-            let mut p = self.pending.lock().unwrap();
+            let mut p = self.wait_for_room(self.pending.lock().unwrap());
             if self.closed.load(Ordering::Acquire) {
                 return;
             }
@@ -1217,8 +1236,8 @@ impl QueueInner {
             p.entries.push(e);
             p.entries.len()
         };
-        // as on PC: a half-full queue submits by itself
-        if n >= (self.capacity / 2).max(1) {
+        // as on PC: a half-full queue submits by itself unless AutoSubmitDisabled is set
+        if self.auto_submit && n >= (self.capacity / 2).max(1) {
             self.submit();
         }
     }
@@ -1234,7 +1253,7 @@ impl QueueInner {
 
     fn enqueue_numbered(self: &Arc<Self>, entry: impl FnOnce(u64) -> Entry) {
         let n = {
-            let mut p = self.pending.lock().unwrap();
+            let mut p = self.wait_for_room(self.pending.lock().unwrap());
             if self.closed.load(Ordering::Acquire) {
                 return;
             }
@@ -1243,7 +1262,7 @@ impl QueueInner {
             p.entries.push(entry(seq));
             p.entries.len()
         };
-        if n >= (self.capacity / 2).max(1) {
+        if self.auto_submit && n >= (self.capacity / 2).max(1) {
             self.submit();
         }
     }
@@ -1280,6 +1299,10 @@ fn queue_vtbl() -> &'static [usize] {
 }
 
 unsafe extern "system" fn factory_create_queue(_p: *mut c_void, desc: *const u8, riid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+    create_queue(desc, riid, out, true)
+}
+
+unsafe fn create_queue(desc: *const u8, riid: *const GUID, out: *mut *mut c_void, auto_submit: bool) -> HRESULT {
     if out.is_null() {
         return E_POINTER;
     }
@@ -1320,6 +1343,8 @@ unsafe extern "system" fn factory_create_queue(_p: *mut c_void, desc: *const u8,
         pool_override: OnceLock::new(),
         #[cfg(test)]
         test_hook: OnceLock::new(),
+        auto_submit,
+        room: Condvar::new(),
     });
     let o = new_object(queue_vtbl(), inner);
     let hr = queue_qi(o, riid, out);
@@ -1452,6 +1477,7 @@ unsafe extern "system" fn queue_cancel(p: *mut c_void, mask: u64, value: u64) {
     let cutoff = {
         let mut pend = q.pending.lock().unwrap();
         pend.entries.retain(|e| !matches!(e, Entry::Request { req, .. } | Entry::Refused { req, .. } if req.tag & mask == value));
+        q.room.notify_all();
         pend.next_seq.saturating_sub(1)
     };
     if cutoff == 0 {
@@ -1479,6 +1505,7 @@ unsafe extern "system" fn queue_close(p: *mut c_void) {
             std::mem::take(&mut pend.entries)
         }
     };
+    q.room.notify_all();
     for e in drained {
         if let Entry::Status(s, i) = e {
             if let Some(slot) = s.slots.get(i as usize) {
@@ -1576,6 +1603,109 @@ mod tests {
         b[0x28..0x30].copy_from_slice(&offset.to_le_bytes());
         b[0x30..0x34].copy_from_slice(&src_size.to_le_bytes());
         b
+    }
+
+    #[test]
+    fn a_queue_with_auto_submit_disabled_waits_for_submit() {
+        use std::time::{Duration, Instant};
+        unsafe {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY_X1, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue1: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(10));
+            for (options, by_itself) in [(AUTO_SUBMIT_DISABLED, false), (0, true)] {
+                let mut desc = [0u8; 0x20];
+                desc[0..4].copy_from_slice(&1u32.to_le_bytes());
+                desc[8..10].copy_from_slice(&4u16.to_le_bytes());
+                desc[10] = 2;
+                desc[0x18..0x20].copy_from_slice(&options.to_le_bytes());
+                let mut q = std::ptr::null_mut();
+                assert_eq!(create_queue1(f, desc.as_ptr(), &IID_QUEUE_X1, &mut q), S_OK);
+                let qv = *(q as *const *const usize);
+                let enqueue: unsafe extern "system" fn(*mut c_void, *const u8) = std::mem::transmute(*qv.add(3));
+                let submit: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(*qv.add(6));
+
+                let src = [0x5Au8; 64];
+                let dst = [vec![0u8; 64], vec![0u8; 64]];
+                for d in &dst {
+                    enqueue(q, request(SOURCE_MEMORY_BIT, d.as_ptr() as u64, 64, src.as_ptr() as u64, 0, 64).as_ptr());
+                }
+                let done = || dst.iter().all(|d| d.iter().all(|b| std::ptr::read_volatile(b) == 0x5A));
+                let t = Instant::now();
+                while !done() && t.elapsed() < Duration::from_millis(300) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert_eq!(done(), by_itself, "options {options:#x}: half-full queue auto-submits only without AutoSubmitDisabled");
+                if !by_itself {
+                    submit(q);
+                    let t = Instant::now();
+                    while !done() && t.elapsed() < Duration::from_secs(5) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    assert!(done(), "Submit runs the queue's requests");
+                }
+                queue_close(q);
+                queue_release(q);
+            }
+        }
+    }
+
+    #[test]
+    fn a_full_queue_with_auto_submit_disabled_holds_an_enqueue_until_submit() {
+        use std::time::{Duration, Instant};
+        unsafe {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY_X1, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue1: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(10));
+            let mut desc = [0u8; 0x20];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes());
+            desc[8..10].copy_from_slice(&2u16.to_le_bytes());
+            desc[10] = 2;
+            desc[0x18..0x20].copy_from_slice(&AUTO_SUBMIT_DISABLED.to_le_bytes());
+            for close_instead in [false, true] {
+                let mut q = std::ptr::null_mut();
+                assert_eq!(create_queue1(f, desc.as_ptr(), &IID_QUEUE_X1, &mut q), S_OK);
+                let qv = *(q as *const *const usize);
+                let enqueue: unsafe extern "system" fn(*mut c_void, *const u8) = std::mem::transmute(*qv.add(3));
+                let submit: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(*qv.add(6));
+
+                let src = [0x3Cu8; 64];
+                let dst = [vec![0u8; 64], vec![0u8; 64], vec![0u8; 64]];
+                let req = |k: usize| request(SOURCE_MEMORY_BIT, dst[k].as_ptr() as u64, 64, src.as_ptr() as u64, 0, 64);
+                enqueue(q, req(0).as_ptr());
+                enqueue(q, req(1).as_ptr());
+                let (third, qa) = (req(2), q as usize);
+                let t = std::thread::spawn(move || {
+                    let e: unsafe extern "system" fn(*mut c_void, *const u8) = enqueue;
+                    e(qa as *mut c_void, third.as_ptr());
+                });
+                std::thread::sleep(Duration::from_millis(200));
+                assert!(!t.is_finished(), "an enqueue into a full queue waits");
+                if close_instead {
+                    queue_close(q);
+                } else {
+                    submit(q);
+                }
+                let t0 = Instant::now();
+                while !t.is_finished() && t0.elapsed() < Duration::from_secs(5) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert!(t.is_finished(), "{} unblocks the held enqueue", if close_instead { "Close" } else { "Submit" });
+                t.join().unwrap();
+                if !close_instead {
+                    submit(q);
+                    let done = || dst.iter().all(|d| d.iter().all(|b| std::ptr::read_volatile(b) == 0x3C));
+                    let t0 = Instant::now();
+                    while !done() && t0.elapsed() < Duration::from_secs(5) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    assert!(done(), "all three requests ran");
+                    queue_close(q);
+                }
+                queue_release(q);
+            }
+        }
     }
 
     #[test]

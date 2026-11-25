@@ -697,9 +697,14 @@ mod tests {
             // reset, and the read-back does not take the rounds that were not recorded
             // under the title's predication the slicer may not run, so its words are not read back
             // (reported by @thehollowedone, #2404); without it they are
-            // (`bind` sets the chain's root signature, as `bind_abi` does)
+            // (`bind` sets the chain's root signature, as `bind_abi` does, on a list with descriptor
+            // heaps, as a title's list has: the signature indexes them directly)
+            let heap = |ty| -> ID3D12DescriptorHeap { dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: ty, NumDescriptors: 1,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, NodeMask: 0 }).unwrap() };
+            let heaps = [Some(heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)), Some(heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER))];
             for predicated in [true, false] {
                 let bind = || {
+                    list.SetDescriptorHeaps(&heaps);
                     list.SetComputeRootSignature(&rs);
                     Ok(())
                 };

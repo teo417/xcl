@@ -996,11 +996,11 @@ pub fn pc_shader_view_format(resource: u32, view: u32) -> u32 {
     let view = pc_view_format(view);
     match (resource, view) {
         // R32G8X24_TYPELESS: depth 21, stencil 22
-        (19..=22, 0 | 19 | 20 | 21 | 39 | 40 | 41) => 21,
-        (19..=22, 22 | 61 | 62) => 22,
+        (19..=22, 0 | 19 | 20 | 21 | 39 | 40 | 41 | 42 | 43) => 21,
+        (19..=22, 22 | 60..=64) => 22,
         // R24G8_TYPELESS: depth 46, stencil 47
-        (44..=47, 0 | 41 | 44 | 45 | 46 | 53 | 54 | 55 | 56) => 46,
-        (44..=47, 47 | 61 | 62) => 47,
+        (44..=47, 0 | 41 | 42 | 44 | 45 | 46 | 53 | 54 | 55 | 56 | 57 | 59) => 46,
+        (44..=47, 47 | 60..=64) => 47,
         // R32_TYPELESS, R16_TYPELESS
         (39 | 40, 0 | 39 | 40) => 41,
         (53 | 55, 0 | 53 | 55) => 56,
@@ -1217,6 +1217,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     note_alias(va as usize, &x);
     // console-only state bits (Unicorn Overlord's 4K display target: 0x100000) are not the
     // PC's: the PC refused the resource (E_INVALIDARG) and the title threw
+    let console_state = state;
     let state = pc_initial_state(u32::from_le_bytes(x[0x30..0x34].try_into().unwrap()), state);
     let mut clear_buf = [0u8; 24];
     let pc_format = u32::from_le_bytes(d[0x20..0x24].try_into().unwrap());
@@ -1239,8 +1240,10 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     // sampled textures: on the same shared 64 KiB pages when tiled resources allow, else committed
     let flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
     let mut placed_hr = None;
+    let mut pc_tex_desc: Option<D3D12_RESOURCE_DESC> = None;
     if !buffer {
         let pc = std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC);
+        pc_tex_desc = Some(pc);
         let console_bytes = crate::hle::xg::Texture::new(&x).ok().map(|t| t.size()).filter(|&s| s != u64::MAX && s != 0);
         if super::vram::gpu_owned(flags) {
             if let Some(hr) = super::vram::place(this, va as usize, &pc, state, clear, console_bytes, riid, ppv) {
@@ -1249,6 +1252,8 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
                         super::title_textures::retire_overlapping(va as usize, bytes as usize);
                     }
                     real::note_title_address(*ppv as usize, va as usize);
+                    super::depth_uav::register_if_depth_uav(this, *ppv, &x, state, console_state);
+                    super::format_alias::register_title_texture(this as usize, *ppv as usize, va as usize, &pc, flags, state);
                 }
                 return hr;
             }
@@ -1264,21 +1269,27 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
         }
     };
     if hr >= 0 && !buffer && !(*ppv).is_null() {
+        super::depth_uav::register_if_depth_uav(this, *ppv, &x, state, console_state);
+        let aliased_to_gpu = pc_tex_desc.as_ref().is_some_and(|pc| {
+            super::format_alias::register_title_texture(this as usize, *ppv as usize, va as usize, pc, flags, state)
+        });
         static M: AtomicU64 = AtomicU64::new(0);
-        match super::title_textures::register(this, *ppv, va as usize, &x, D3D12_RESOURCE_STATES(state as i32)) {
-            Ok(()) => {
-                real::note_title_address(*ppv as usize, va as usize);
-                return hr;
+        if !aliased_to_gpu {
+            match super::title_textures::register(this, *ppv, va as usize, &x, D3D12_RESOURCE_STATES(state as i32)) {
+                Ok(()) => {
+                    real::note_title_address(*ppv as usize, va as usize);
+                    return hr;
+                }
+                Err(e) if once(&M, 4) => {
+                    let u = |o: usize| u32::from_le_bytes(x[o..o + 4].try_into().unwrap());
+                    crate::xlog_warn!(
+                        "D3D12.X: CreatePlacedResourceX texture at {va:#x} (dimension {} {}x{}x{}, {} mips, format {}, {} samples, layout {:#x}, flags {:#x}): not kept in step with the memory ({e})",
+                        u(0), u64::from_le_bytes(x[0x10..0x18].try_into().unwrap()), u(0x18), u16::from_le_bytes(x[0x1C..0x1E].try_into().unwrap()),
+                        u16::from_le_bytes(x[0x1E..0x20].try_into().unwrap()), u(0x20), u(0x24), u(0x2C), u(0x30)
+                    )
+                }
+                Err(_) => {}
             }
-            Err(e) if once(&M, 4) => {
-                let u = |o: usize| u32::from_le_bytes(x[o..o + 4].try_into().unwrap());
-                crate::xlog_warn!(
-                    "D3D12.X: CreatePlacedResourceX texture at {va:#x} (dimension {} {}x{}x{}, {} mips, format {}, {} samples, layout {:#x}, flags {:#x}): not kept in step with the memory ({e})",
-                    u(0), u64::from_le_bytes(x[0x10..0x18].try_into().unwrap()), u(0x18), u16::from_le_bytes(x[0x1C..0x1E].try_into().unwrap()),
-                    u16::from_le_bytes(x[0x1E..0x20].try_into().unwrap()), u(0x20), u(0x24), u(0x2C), u(0x30)
-                )
-            }
-            Err(_) => {}
         }
     }
     if hr >= 0 && !(*ppv).is_null() {

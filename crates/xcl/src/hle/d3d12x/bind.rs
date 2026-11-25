@@ -28,6 +28,8 @@ struct State {
     /// the title's graphics root signature (a PC object), bound before a draw with an
     /// untranslated pipeline – created with it – since SetGraphicsRootSignature binds nothing
     rs_gfx: usize,
+    /// the title's compute root signature (a PC object), preserved for internal-pass restoration
+    rs_cs: usize,
     pso: usize,
     allocator: usize,
     /// unified memory of this recording (io, argument tables)
@@ -240,6 +242,7 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.layout_gfx = None;
         s.args_gfx.clear();
         s.rs_gfx = 0;
+        s.rs_cs = 0;
         (s.scratch, s.scratch_used, s.scratch_taken) = (None, 0, 0);
         (old, std::mem::take(&mut s.uma), std::mem::take(&mut s.res_retired))
     });
@@ -257,6 +260,7 @@ pub(super) fn clear_state(list: *mut c_void, pso: usize) {
         s.layout_gfx = None;
         s.args_gfx.clear();
         s.rs_gfx = 0;
+        s.rs_cs = 0;
     });
 }
 
@@ -264,8 +268,8 @@ pub(super) fn clear_state(list: *mut c_void, pso: usize) {
 /// deferred mid-list split (`to` records into `allocator` with its own fresh UMA arena while
 /// `from` retains its previously allocated blocks until `allocator` resets).
 pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: usize) {
-    let (layout, args, layout_gfx, args_gfx, rs_gfx, pso) = with(from, |s| {
-        (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.pso)
+    let (layout, args, layout_gfx, args_gfx, rs_gfx, rs_cs, pso) = with(from, |s| {
+        (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.rs_cs, s.pso)
     });
     let (old, blocks) = with(to, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
@@ -275,6 +279,7 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
         s.layout_gfx = layout_gfx;
         s.args_gfx = args_gfx;
         s.rs_gfx = rs_gfx;
+        s.rs_cs = rs_cs;
         s.pso = pso;
         (old, std::mem::take(&mut s.uma))
     });
@@ -1585,6 +1590,7 @@ pub(super) unsafe extern "system" fn set_compute_root_signature(this: *mut c_voi
             s.args = vec![0u8; layout.as_ref().map_or(0, |l| l.size as usize)];
         }
         s.layout = layout;
+        s.rs_cs = rs as usize;
     });
 }
 
@@ -1907,6 +1913,17 @@ pub(super) fn tracked_pso(list: *mut c_void) -> usize {
         .as_ref()
         .and_then(|m| m.get(&(list as usize)))
         .map_or(0, |s| s.pso)
+}
+
+/// Tracked console `(graphics_root_signature, compute_root_signature)` on `list` for restoring
+/// PC root signatures after an internal graphics/compute sync pass.
+pub(super) fn tracked_root_sigs(list: *mut c_void) -> (usize, usize) {
+    STATES
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(&(list as usize)))
+        .map_or((0, 0), |s| (s.rs_gfx, s.rs_cs))
 }
 
 #[cfg(test)]

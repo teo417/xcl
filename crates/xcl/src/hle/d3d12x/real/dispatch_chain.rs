@@ -65,8 +65,10 @@ struct Chain {
     build_whole: Mutex<()>,
     /// its command signature for ExecuteIndirect (`pso::chain_command_signature`)
     signature: OnceLock<ID3D12CommandSignature>,
-    /// the most slabs one of its ExecuteIndirects had, and whether one was read back yet
+    /// the most slabs one of its ExecuteIndirects had, the last one read back, and whether one
+    /// was read back yet
     slabs: std::sync::atomic::AtomicU32,
+    last: std::sync::atomic::AtomicU32,
     measured: std::sync::atomic::AtomicBool,
     /// its whole form was asked for in the background / a lost slab was reported
     wanted: std::sync::atomic::AtomicBool,
@@ -124,7 +126,7 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
     let first = pieces.next()?;
     let chain = Arc::new(Chain { builder, tail: pieces.collect(), words: plan.dwords_per_group,
         whole_code: whole.to_vec(), whole: OnceLock::new(), build_whole: Mutex::new(()), signature: OnceLock::new(),
-        slabs: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() });
+        slabs: Default::default(), last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() });
     PROGRAMS.fetch_add(1, Ordering::Relaxed);
     PIECES.fetch_add(plan.pieces.len() as u64, Ordering::Relaxed);
     *result = first.into_raw();
@@ -184,6 +186,7 @@ impl Recording {
         let [partial, _, slabs, _] = unsafe { std::ptr::read_volatile((p as *const u8).add(i.at as usize) as *const [u32; 4]) };
         unsafe { i.commands.Unmap(0, Some(&D3D12_RANGE::default())) };
         self.chain.slabs.fetch_max(slabs, Ordering::Relaxed);
+        self.chain.last.store(slabs, Ordering::Relaxed);
         self.chain.measured.store(true, Ordering::Relaxed);
         if partial == 0 { return; }
         if i.whole {
@@ -330,6 +333,14 @@ fn indirect_rounds(seen: &[[u32; 3]], most: u64, before: Option<u32>, cap: u32) 
     (want + want.div_ceil(4)).clamp(2, u64::from(cap.max(2))) as u32
 }
 
+/// The slabs of an earlier ExecuteIndirect of the program for `indirect_rounds` (None: none was
+/// read back yet). Until its whole form is built, the most any had: slabs past the rounds are
+/// lost. Then the last one's, as more run the whole form: every round costs its pieces'
+/// ExecuteIndirects, also when empty (each ~14 us of GPU after its barrier on an RTX 5070 Ti, #2404).
+fn slabs_before(measured: bool, whole: bool, most: u32, last: u32) -> Option<u32> {
+    measured.then_some(if whole { last } else { most })
+}
+
 /// An ExecuteIndirect of split program `pso` whose command signature is one Dispatch of `stride`
 /// bytes: `commands` of them at GPU address `args` (their count at `count`, when given), run as
 /// the chain. `seen`: the arguments the CPU sees there now. `bind` binds the ABI after the
@@ -354,11 +365,11 @@ pub(in crate::hle::d3d12x) unsafe fn execute_indirect(list: &ID3D12GraphicsComma
         Some(s) => s.clone(),
         None => { let s = pso::chain_command_signature(dev, &chain.builder.signature)?; chain.signature.get_or_init(|| s).clone() }
     };
-    let before = chain.measured.load(Ordering::Relaxed).then(|| chain.slabs.load(Ordering::Relaxed));
+    let full = chain.whole.get().cloned().map(|p| pso::dispatch_command_signature(dev).map(|s| (p, s))).transpose()?;
+    let before = slabs_before(chain.measured.load(Ordering::Relaxed), full.is_some(), chain.slabs.load(Ordering::Relaxed), chain.last.load(Ordering::Relaxed));
     let rounds = indirect_rounds(seen, most, before, most_rounds());
     let pieces = chain.tail.len() as u32 + 1;
     let buffer = pso::chain_commands_buffer(dev, rounds, pieces, commands).ok_or("no buffer for the commands of a chained ExecuteIndirect")?;
-    let full = chain.whole.get().cloned().map(|p| pso::dispatch_command_signature(dev).map(|s| (p, s))).transpose()?;
     // not built: asked for now, so that it is there before an ExecuteIndirect of the program
     // needs more slabs than its rounds (until then those are lost)
     if full.is_none() {
@@ -454,6 +465,19 @@ mod tests {
     }
 
     #[test]
+    fn once_the_whole_form_is_built_the_last_execute_indirect_sizes_the_rounds() {
+        use super::{indirect_rounds, slabs_before};
+        assert_eq!(slabs_before(false, true, 17, 1), None);
+        // not built: the most slabs any had, so that none are lost
+        assert_eq!(slabs_before(true, false, 17, 1), Some(17));
+        assert_eq!(indirect_rounds(&[[0, 0, 0]], 1, slabs_before(true, false, 17, 1), 32), 22);
+        // built: the last one's, an overflow runs the whole form
+        assert_eq!(slabs_before(true, true, 17, 1), Some(1));
+        assert_eq!(indirect_rounds(&[[0, 0, 0]], 1, slabs_before(true, true, 17, 1), 32), 2);
+        assert_eq!(indirect_rounds(&[[3, 1, 1]], 1, slabs_before(true, true, 17, 1), 32), 4);
+    }
+
+    #[test]
     fn the_whole_form_built_in_the_background_waits_for_a_huge_compiles_turn() {
         use super::super::{big_compile_turn, driver_compile, huge_pso_bytes, huge_pso_concurrency, BIG_COMPILES, GIANT_COMPILES};
         // every slot taken: a huge compile on `want_whole`'s thread waits for one
@@ -485,7 +509,7 @@ mod tests {
             let builder = Arc::new(PipelineBuilder { device: dev.clone(), create: never, signature: rs.clone(), flags: D3D12_PIPELINE_STATE_FLAG_NONE, node: 0, record: 0 });
             let pso = first.as_raw() as usize;
             CHAINS.lock().unwrap().insert(pso, Arc::new(Chain { builder, tail: vec![first.clone()], words: 4, whole_code: Vec::new(), whole: OnceLock::new(),
-                build_whole: Mutex::new(()), signature: OnceLock::new(), slabs: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() }));
+                build_whole: Mutex::new(()), signature: OnceLock::new(), slabs: Default::default(), last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() }));
             let ty = D3D12_COMMAND_LIST_TYPE_COMPUTE;
             let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
             let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, None).unwrap();

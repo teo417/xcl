@@ -1346,21 +1346,23 @@ pub(crate) fn slab_count(grid: [u32; 3], most: u64) -> u64 {
 }
 
 /// A chain's dispatch of `grid` groups, `most` of them at once (`dispatch_slabs`). `used`: the
-/// list (or one before it) has used `scratch`.
+/// list (or one before it) has used `scratch`. `constants`: the CPU and GPU addresses of memory the
+/// GPU reads as constants, `CHAIN_COMMAND_BYTES` for each slab (its size and origin, for the pieces).
 pub(crate) unsafe fn record_dispatch_chain<'a>(
-    list: &ID3D12GraphicsCommandList, grid: [u32; 3], most: u64, scratch: &ID3D12Resource, used: bool,
+    list: &ID3D12GraphicsCommandList, grid: [u32; 3], most: u64, scratch: &ID3D12Resource, used: bool, constants: (*mut u8, u64),
     pieces: impl IntoIterator<Item = &'a ID3D12PipelineState> + Clone,
 ) {
     list.SetComputeRootUnorderedAccessView(6, scratch.GetGPUVirtualAddress());
     for (slab, (origin, size)) in dispatch_slabs(grid, most).into_iter().enumerate() {
     let ([x, y, z], [ox, oy, oz]) = (size, origin);
+    let at = slab * CHAIN_COMMAND_BYTES as usize;
+    std::ptr::write_unaligned(constants.0.add(at) as *mut [u32; 8], [x, y, z, 0, ox, oy, oz, 0]);
+    list.SetComputeRootConstantBufferView(7, constants.1 + at as u64);
     for (i, piece) in pieces.clone().into_iter().enumerate() {
         if i != 0 || slab != 0 || used {
             list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
                 Anonymous: D3D12_RESOURCE_BARRIER_0 { UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }) } }]);
         }
-        let constants = [x, y, z, i as u32, ox, oy, oz, 0];
-        list.SetComputeRoot32BitConstants(7, 8, constants.as_ptr().cast(), 0);
         list.SetPipelineState(piece);
         list.Dispatch(x, y, z);
     }
@@ -1371,44 +1373,31 @@ pub(crate) fn dispatch_chain_root_signature(dev: &ID3D12Device, samplers: &[Stat
     abi_signature(dev, false, samplers, true)
 }
 
-/// Bytes of one command of a chain's ExecuteIndirect (`chain_command_signature`): the eight
-/// root constants of `record_dispatch_chain` and the slab's Dispatch.
-pub(crate) const CHAIN_COMMAND_BYTES: u32 = 44;
-
-/// The command signature of a chain's ExecuteIndirect on the chain's root signature `rs`.
-pub(crate) fn chain_command_signature(dev: &ID3D12Device, rs: &ID3D12RootSignature) -> Result<ID3D12CommandSignature, String> {
-    let args = [
-        D3D12_INDIRECT_ARGUMENT_DESC { Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT, Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
-            Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 { RootParameterIndex: 7, DestOffsetIn32BitValues: 0, Num32BitValuesToSet: 8 } } },
-        D3D12_INDIRECT_ARGUMENT_DESC { Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, ..Default::default() },
-    ];
-    let desc = D3D12_COMMAND_SIGNATURE_DESC { ByteStride: CHAIN_COMMAND_BYTES, NumArgumentDescs: 2, pArgumentDescs: args.as_ptr(), NodeMask: 0 };
-    let mut sig: Option<ID3D12CommandSignature> = None;
-    unsafe { dev.CreateCommandSignature(&desc, rs, &mut sig) }.map_err(|e| format!("CreateCommandSignature: {e}"))?;
-    sig.ok_or_else(|| "CreateCommandSignature".into())
-}
+/// Bytes of a slab's constants for a chain's pieces (the eight words `record_dispatch_chain`
+/// writes, read as a root CBV and so 256-byte aligned); in a chain's ExecuteIndirect commands
+/// (`SLICER`) the slab's Dispatch follows them, `CHAIN_DISPATCH_AT` bytes in.
+pub(crate) const CHAIN_COMMAND_BYTES: u32 = 256;
+pub(crate) const CHAIN_DISPATCH_AT: u64 = 32;
 
 /// One thread that turns a title's Dispatch arguments into a chain's commands: each command's
-/// groups in the slabs of `dispatch_slabs`, one slab a round, `rounds` rounds of `pieces`
-/// commands (`CHAIN_COMMAND_BYTES` each; unused rounds dispatch nothing). After them
+/// groups in the slabs of `dispatch_slabs`, one slab a round, `rounds` rounds of one command
+/// (`CHAIN_COMMAND_BYTES` each, for all the pieces; unused rounds dispatch nothing). After them
 /// (`chain_tail_offset`): 1 when the rounds did not hold every slab, 0, the slabs there were (at
 /// most 2^32 - 256), 0; then `commands` Dispatch arguments for the whole form. With `whole` set
 /// and more slabs than rounds, those are the title's and the rounds dispatch nothing; else they
 /// are empty. So one of the two runs without predication (on NVIDIA Ampere cards, under one
 /// predicate both ran in part, #2404).
 const SLICER: &str = r#"
-#define RS "RootConstants(num32BitConstants=7, b0), SRV(t0), SRV(t1), UAV(u0)"
-cbuffer C : register(b0) { uint rounds; uint most; uint commands; uint stride; uint counted; uint pieces; uint whole; };
+#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0)"
+cbuffer C : register(b0) { uint rounds; uint most; uint commands; uint stride; uint counted; uint whole; };
 ByteAddressBuffer args : register(t0);
 ByteAddressBuffer count : register(t1);
 RWByteAddressBuffer cmds : register(u0);
 void put(uint r, uint3 n, uint3 o) {
-    for (uint i = 0; i < pieces; i++) {
-        uint at = (r * pieces + i) * 44;
-        cmds.Store4(at, uint4(n, i));
-        cmds.Store4(at + 16, uint4(o, 0));
-        cmds.Store3(at + 32, n);
-    }
+    uint at = r * 256;
+    cmds.Store4(at, uint4(n, 0));
+    cmds.Store4(at + 16, uint4(o, 0));
+    cmds.Store3(at + 32, n);
 }
 uint3 slab(uint3 g) {
     uint3 s;
@@ -1443,7 +1432,7 @@ void main() {
                 }
     }
     for (; r < rounds; r++) put(r, 0, 0);
-    uint at = (rounds * pieces * 44 + 7) & ~7u;
+    uint at = rounds * 256;
     cmds.Store4(at, uint4(partial ? 1 : 0, 0, (uint)min(slabs, 4294967040.0), 0));
     for (uint k = 0; k < commands; k++) cmds.Store3(at + 16 + k * 12, full && k < n ? args.Load3(k * stride) : 0);
 }
@@ -1451,17 +1440,17 @@ void main() {
 
 /// Where the slicer's words after the rounds are in a chain's command buffer; the whole form's
 /// Dispatch arguments follow 16 bytes later
-pub(crate) fn chain_tail_offset(rounds: u32, pieces: u32) -> u64 {
-    u64::from(rounds * pieces * CHAIN_COMMAND_BYTES).next_multiple_of(8)
+pub(crate) fn chain_tail_offset(rounds: u32) -> u64 {
+    u64::from(rounds) * u64::from(CHAIN_COMMAND_BYTES)
 }
 
 /// Bytes of a chain's command buffer (`SLICER`) for `commands` of the title's
-pub(crate) fn chain_commands_bytes(rounds: u32, pieces: u32, commands: u32) -> u64 {
-    chain_tail_offset(rounds, pieces) + 16 + 12 * u64::from(commands)
+pub(crate) fn chain_commands_bytes(rounds: u32, commands: u32) -> u64 {
+    chain_tail_offset(rounds) + 16 + 12 * u64::from(commands)
 }
 
-/// A command signature of one Dispatch (12 bytes), for the whole form's arguments (made once per
-/// device).
+/// A command signature of one Dispatch (12 bytes), for the whole form's arguments and the rounds'
+/// (made once per device).
 pub(crate) fn dispatch_command_signature(dev: &ID3D12Device) -> Result<ID3D12CommandSignature, String> {
     static MADE: Mutex<Option<(usize, ID3D12CommandSignature)>> = Mutex::new(None);
     let mut g = MADE.lock().unwrap();
@@ -1496,9 +1485,9 @@ fn slicer(dev: &ID3D12Device) -> Result<(ID3D12RootSignature, ID3D12PipelineStat
 }
 
 /// A chain's command buffer (`chain_commands_bytes`) in the UNORDERED_ACCESS state: the slicer
-/// writes it, ExecuteIndirect reads it, and the CPU reads the slabs back.
-pub(crate) unsafe fn chain_commands_buffer(dev: &ID3D12Device, rounds: u32, pieces: u32, commands: u32) -> Option<ID3D12Resource> {
-    chain_commands_buffer_of(dev, chain_commands_bytes(rounds, pieces, commands))
+/// writes it, ExecuteIndirect and the pieces read it, and the CPU reads the slabs back.
+pub(crate) unsafe fn chain_commands_buffer(dev: &ID3D12Device, rounds: u32, commands: u32) -> Option<ID3D12Resource> {
+    chain_commands_buffer_of(dev, chain_commands_bytes(rounds, commands))
 }
 
 /// `chain_commands_buffer` of `bytes` (at least what the chain's commands take).
@@ -1517,18 +1506,18 @@ pub(crate) unsafe fn chain_commands_buffer_of(dev: &ID3D12Device, bytes: u64) ->
 
 /// The slicer's dispatch: the title's `commands` commands of `stride` bytes at `args` (GPU
 /// address; the count at `count` when there is one) into `out` (`chain_commands_bytes`, in the
-/// UNORDERED_ACCESS state, left in INDIRECT_ARGUMENT); `whole`: the whole form runs when the
+/// UNORDERED_ACCESS state, left in INDIRECT_ARGUMENT and VERTEX_AND_CONSTANT_BUFFER); `whole`: the whole form runs when the
 /// rounds cannot hold the slabs. It sets the list's compute root signature: the caller binds its
 /// own again.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn record_slicer(list: &ID3D12GraphicsCommandList, args: u64, stride: u32, commands: u32, count: Option<u64>,
-    rounds: u32, most: u64, pieces: u32, whole: bool, out: &ID3D12Resource) -> Result<(), String> {
+    rounds: u32, most: u64, whole: bool, out: &ID3D12Resource) -> Result<(), String> {
     let dev: ID3D12Device = { let mut d: Option<ID3D12Device> = None; list.GetDevice(&mut d).map_err(|e| e.to_string())?; d.ok_or("device")? };
     let (rs, pso) = slicer(&dev)?;
-    let constants = [rounds, most.min(u64::from(u32::MAX)) as u32, commands, stride, count.is_some() as u32, pieces, whole as u32];
+    let constants = [rounds, most.min(u64::from(u32::MAX)) as u32, commands, stride, count.is_some() as u32, whole as u32];
     list.SetComputeRootSignature(&rs);
     list.SetPipelineState(&pso);
-    list.SetComputeRoot32BitConstants(0, 7, constants.as_ptr().cast(), 0);
+    list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
     list.SetComputeRootShaderResourceView(1, args);
     list.SetComputeRootShaderResourceView(2, count.unwrap_or(args));
     list.SetComputeRootUnorderedAccessView(3, out.GetGPUVirtualAddress());
@@ -1539,29 +1528,47 @@ pub(crate) unsafe fn record_slicer(list: &ID3D12GraphicsCommandList, args: u64, 
     list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
         Anonymous: D3D12_RESOURCE_BARRIER_0 { Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
             pResource: std::mem::transmute_copy(out), Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-            StateBefore: D3D12_RESOURCE_STATE_UNORDERED_ACCESS, StateAfter: D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT }) } }]);
+            StateBefore: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            StateAfter: D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT | D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER }) } }]);
     Ok(())
 }
 
 /// `record_dispatch_chain` from the slicer's commands in `commands` (`rounds` rounds), after the
-/// six common root views have been bound.
+/// six common root views have been bound. `sig`: `dispatch_command_signature`. The pieces read
+/// their round's constants as a root CBV: an ExecuteIndirect that sets root constants costs
+/// ~15 us of GPU after a UAV barrier, one of a Dispatch ~0.4 us (RTX 5070 Ti, #2404).
 pub(crate) unsafe fn record_dispatch_chain_indirect<'a>(
     list: &ID3D12GraphicsCommandList, sig: &ID3D12CommandSignature, commands: &ID3D12Resource, rounds: u32,
     scratch: &ID3D12Resource, pieces: impl IntoIterator<Item = &'a ID3D12PipelineState> + Clone,
 ) {
-    let n = pieces.clone().into_iter().count() as u32;
     list.SetComputeRootUnorderedAccessView(6, scratch.GetGPUVirtualAddress());
     for r in 0..rounds {
-        for (i, piece) in pieces.clone().into_iter().enumerate() {
+        let at = u64::from(r) * u64::from(CHAIN_COMMAND_BYTES);
+        list.SetComputeRootConstantBufferView(7, commands.GetGPUVirtualAddress() + at);
+        for piece in pieces.clone() {
             list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
                 Anonymous: D3D12_RESOURCE_BARRIER_0 { UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }) } }]);
             list.SetPipelineState(piece);
-            list.ExecuteIndirect(sig, 1, commands, u64::from((r * n + i as u32) * CHAIN_COMMAND_BYTES), None::<&ID3D12Resource>, 0);
+            list.ExecuteIndirect(sig, 1, commands, at + CHAIN_DISPATCH_AT, None::<&ID3D12Resource>, 0);
         }
     }
 }
 
 fn abi_signature(dev: &ID3D12Device, graphics: bool, samplers: &[StaticSampler], split: bool) -> Result<ID3D12RootSignature, String> {
+    let blob = abi_signature_blob(graphics, samplers, split)?;
+    unsafe { dev.CreateRootSignature(0, &blob).map_err(|e| format!("CreateRootSignature: {e}")) }
+}
+
+/// A hash of the compute ABI root signature (serialized, no static samplers). The pieces of a
+/// split program keep their driver blob under it (`driver_cache::name_for`): their DXIL stays the
+/// same when the chain's root parameters change, and the driver refuses a blob built for others.
+pub(crate) fn abi_signature_id(split: bool) -> u64 {
+    static SPLIT: OnceLock<u64> = OnceLock::new();
+    let id = || abi_signature_blob(false, &[], split).map_or(0, |b| crate::gpu::shader::fnv64(&b));
+    if split { *SPLIT.get_or_init(id) } else { id() }
+}
+
+fn abi_signature_blob(graphics: bool, samplers: &[StaticSampler], split: bool) -> Result<Vec<u8>, String> {
     let statics: Vec<D3D12_STATIC_SAMPLER_DESC> = samplers.iter().enumerate().map(|(k, s)| static_sampler_desc(k as u32, s)).collect();
     unsafe {
         // u0 io, u1 res, u2..u5 the memory windows (`gpu::uma`; unused ones need no binding)
@@ -1582,10 +1589,11 @@ fn abi_signature(dev: &ID3D12Device, graphics: bool, samplers: &[StaticSampler],
                 } },
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
+            // the slab's constants (`CHAIN_COMMAND_BYTES`)
             params.push(D3D12_ROOT_PARAMETER1 {
-                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
-                Anonymous: D3D12_ROOT_PARAMETER1_0 { Constants: D3D12_ROOT_CONSTANTS {
-                    ShaderRegister: 0, RegisterSpace: 2, Num32BitValues: 8,
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_CBV,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 { Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                    ShaderRegister: 0, RegisterSpace: 2, Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
                 } },
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
@@ -1609,7 +1617,7 @@ fn abi_signature(dev: &ID3D12Device, graphics: bool, samplers: &[StaticSampler],
         let mut blob: Option<ID3DBlob> = None;
         D3D12SerializeVersionedRootSignature(&desc, &mut blob, None).map_err(|e| format!("{e}"))?;
         let blob = blob.ok_or("root signature")?;
-        dev.CreateRootSignature(0, std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize())).map_err(|e| format!("CreateRootSignature: {e}"))
+        Ok(std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()).to_vec())
     }
 }
 

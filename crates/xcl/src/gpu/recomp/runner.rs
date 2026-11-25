@@ -1686,15 +1686,13 @@ pub(crate) fn dispatch_split_indirect(
     };
     let pieces: Vec<ID3D12PipelineState> = chain.pieces.iter().map(|d| make(d)).collect::<Result<_, _>>()?;
     let whole = ind.whole.map(make).transpose()?;
-    let n = pieces.len() as u32;
     let mut words = ind.args.to_vec();
     words.push(ind.count.unwrap_or(0));
     let count_at = ind.args.len() as u64 * 4;
     let args = buffer(&dev, words.len() as u64 * 4, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false)?;
-    let commands = unsafe { super::pso::chain_commands_buffer(&dev, ind.rounds, n, ind.commands) }.ok_or("chain command buffer")?;
-    let sig = super::pso::chain_command_signature(&dev, &rs)?;
+    let commands = unsafe { super::pso::chain_commands_buffer(&dev, ind.rounds, ind.commands) }.ok_or("chain command buffer")?;
     let one = super::pso::dispatch_command_signature(&dev)?;
-    let at = super::pso::chain_tail_offset(ind.rounds, n);
+    let at = super::pso::chain_tail_offset(ind.rounds);
     unsafe {
         let mut p = std::ptr::null_mut();
         args.Map(0, None, Some(&mut p)).map_err(e)?;
@@ -1703,7 +1701,7 @@ pub(crate) fn dispatch_split_indirect(
     }
     let mut record = |list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource, views: [u64; 3]| unsafe {
         let va = args.GetGPUVirtualAddress();
-        super::pso::record_slicer(list, va, ind.stride, ind.commands, ind.count.map(|_| va + count_at), ind.rounds, most, n, whole.is_some(), &commands)?;
+        super::pso::record_slicer(list, va, ind.stride, ind.commands, ind.count.map(|_| va + count_at), ind.rounds, most, whole.is_some(), &commands)?;
         list.SetComputeRootSignature(&rs);
         for (i, v) in views.into_iter().enumerate() {
             list.SetComputeRootUnorderedAccessView(i as u32, v);
@@ -1712,7 +1710,7 @@ pub(crate) fn dispatch_split_indirect(
             list.SetPipelineState(whole);
             list.ExecuteIndirect(&one, ind.commands, &commands, at + 16, None::<&ID3D12Resource>, 0);
         }
-        super::pso::record_dispatch_chain_indirect(list, &sig, &commands, ind.rounds, scratch, &pieces);
+        super::pso::record_dispatch_chain_indirect(list, &one, &commands, ind.rounds, scratch, &pieces);
         Ok(())
     };
     let mem = dispatch_with(&gpu.dev, &gpu.queue, &gpu.fence, &mut gpu.value, &pieces[0], &rs, [1, 1, 1], &[], mem, 1, false,
@@ -1883,6 +1881,14 @@ fn dispatch_with(
             let bytes = if record.is_some() { most * 4 * u64::from(words) } else { first.iter().fold(4 * u64::from(words), |n, &g| n * u64::from(g)) };
             buffer(dev, bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true)
         }).transpose()?;
+        // the slabs' constants (`pso::record_dispatch_chain`), the same for every one of the `reps`
+        let constants = chain.filter(|_| record.is_none()).map(|(_, _, most)| {
+            let bytes = super::pso::slab_count(groups, most) * u64::from(super::pso::CHAIN_COMMAND_BYTES);
+            let b = buffer(dev, bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false)?;
+            let mut p = std::ptr::null_mut();
+            b.Map(0, None, Some(&mut p)).map_err(e)?;
+            Ok::<_, String>((p as *mut u8, b.GetGPUVirtualAddress(), b))
+        }).transpose()?;
         // `reps` dispatches, each between two timestamps when `timed`
         let stamps = 2 * reps as u32;
         let queries = if timed {
@@ -1903,8 +1909,8 @@ fn dispatch_with(
             }
             if let (Some(record), Some(scratch)) = (record.as_mut(), &scratch) {
                 record(&list, scratch, [io_buf.GetGPUVirtualAddress(), res_buf.GetGPUVirtualAddress(), mem_buf.GetGPUVirtualAddress()])?;
-            } else if let (Some((pieces, _, most)), Some(scratch)) = (chain, &scratch) {
-                super::pso::record_dispatch_chain(&list, groups, most, scratch, k > 0, pieces);
+            } else if let (Some((pieces, _, most)), Some(scratch), Some((cpu, gpu, _))) = (chain, &scratch, &constants) {
+                super::pso::record_dispatch_chain(&list, groups, most, scratch, k > 0, (*cpu, *gpu), pieces);
             } else {
                 list.Dispatch(groups[0], groups[1], groups[2]);
             }

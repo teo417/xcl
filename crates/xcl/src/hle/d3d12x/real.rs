@@ -4668,8 +4668,16 @@ pub(crate) mod driver_cache {
     /// Like [`name`], using `.chain.pso` for pipelines built with the dispatch chain's root
     /// signature (`dispatch_chain`).
     pub fn name_for(dxil: &[u8], flags: i32, chained: bool) -> String {
-        let ext = if chained { "chain.pso" } else { "pso" };
-        format!("{:016x}-{:x}-{:x}.{ext}", crate::gpu::shader::fnv64(dxil), dxil.len(), flags)
+        if chained {
+            return chain_name(dxil, flags, crate::gpu::recomp::pso::abi_signature_id(true));
+        }
+        format!("{:016x}-{:x}-{:x}.pso", crate::gpu::shader::fnv64(dxil), dxil.len(), flags)
+    }
+
+    /// A piece's file also names the root signature it was built with (its DXIL doesn't change
+    /// with it), so a blob of another chain form is not read and refused.
+    fn chain_name(dxil: &[u8], flags: i32, signature: u64) -> String {
+        format!("{:016x}-{:x}-{:x}-{signature:016x}.chain.pso", crate::gpu::shader::fnv64(dxil), dxil.len(), flags)
     }
 
     /// The file of a translated graphics pipeline keyed by its full state + shader digest.
@@ -4779,7 +4787,18 @@ pub(crate) mod driver_cache {
             assert!(name(&[0u8; 0x1234], 2).ends_with("-1234-2.pso"));
             assert_eq!(name_for(b"abc", 0, false), name(b"abc", 0));
             assert_ne!(name_for(b"abc", 0, true), name_for(b"abc", 0, false));
-            assert!(name_for(&[0u8; 0x1234], 2, true).ends_with("-1234-2.chain.pso"));
+            let piece = name_for(&[0u8; 0x1234], 2, true);
+            assert!(piece.contains("-1234-2-") && piece.ends_with(".chain.pso"), "{piece}");
+        }
+
+        #[test]
+        fn a_piece_is_named_after_the_root_signature_it_was_built_with() {
+            use crate::gpu::recomp::pso::abi_signature_id;
+            let (split, plain) = (abi_signature_id(true), abi_signature_id(false));
+            assert!(split != 0 && plain != 0, "the signatures serialize");
+            assert_ne!(split, plain);
+            assert_ne!(chain_name(b"abc", 0, split), chain_name(b"abc", 0, plain), "one DXIL, two root signatures");
+            assert_eq!(name_for(b"abc", 0, true), chain_name(b"abc", 0, split));
         }
 
         #[test]

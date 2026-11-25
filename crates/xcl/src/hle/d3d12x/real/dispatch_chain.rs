@@ -78,8 +78,6 @@ struct Chain {
     build_whole: Mutex<()>,
     /// threads other than `want_whole`'s waiting for the whole form
     waiting: std::sync::atomic::AtomicUsize,
-    /// its command signature for ExecuteIndirect (`pso::chain_command_signature`)
-    signature: OnceLock<ID3D12CommandSignature>,
     /// the slabs of the last of its ExecuteIndirects read back, and whether one was read back yet
     last: std::sync::atomic::AtomicU32,
     measured: std::sync::atomic::AtomicBool,
@@ -192,7 +190,7 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
     let mut pieces = built.into_iter().collect::<Option<Vec<_>>>()?.into_iter();
     let first = pieces.next()?;
     let chain = Arc::new(Chain { builder, tail: pieces.collect(), words: plan.dwords_per_group,
-        whole_code: whole.to_vec(), whole: OnceLock::new(), build_whole: Mutex::new(()), waiting: Default::default(), signature: OnceLock::new(),
+        whole_code: whole.to_vec(), whole: OnceLock::new(), build_whole: Mutex::new(()), waiting: Default::default(),
         last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() });
     PROGRAMS.fetch_add(1, Ordering::Relaxed);
     PIECES.fetch_add(plan.pieces.len() as u64, Ordering::Relaxed);
@@ -289,6 +287,7 @@ static SHARED: LazyLock<Mutex<HashMap<usize, (usize, std::sync::Weak<Scratch>)>>
 pub(in crate::hle::d3d12x) fn list_reset(list: usize) {
     SHARED.lock().unwrap().remove(&list);
     LIST_RECORDINGS.lock().unwrap().remove(&list);
+    release_constants(list);
 }
 
 /// `to` records right after `from` on the same allocator: its chains go on in `from`'s scratch.
@@ -414,18 +413,96 @@ pub(in crate::hle::d3d12x) fn cmd_buffer_stats() -> (u64, u64, u64, u64, u64) {
 }
 
 pub(in crate::hle::d3d12x) fn allocator_reset(allocator: usize) {
-    let Some(recordings) = RECORDINGS.lock().unwrap().remove(&allocator) else { return };
-    for r in recordings {
-        match Arc::try_unwrap(r) {
-            Ok(mut rec) => {
-                rec.read_back();
-                if let Some(ind) = rec.indirect.take() {
-                    return_cmd_buffer(ind.bytes, ind.commands);
+    if let Some(recordings) = RECORDINGS.lock().unwrap().remove(&allocator) {
+        for r in recordings {
+            match Arc::try_unwrap(r) {
+                Ok(mut rec) => {
+                    rec.read_back();
+                    if let Some(ind) = rec.indirect.take() {
+                        return_cmd_buffer(ind.bytes, ind.commands);
+                    }
                 }
+                Err(r) => drop(r),
             }
-            Err(r) => drop(r),
         }
     }
+    release_constants(allocator);
+}
+
+/// The slab constants of an allocator's (or an XCL-owned list's) recordings are free to reuse.
+fn release_constants(key: usize) {
+    let constants = CONSTANTS.lock().unwrap().remove(&key);
+    if let Some((blocks, _)) = constants {
+        let gone = keep_free_constants(&mut FREE_CONSTANTS.lock().unwrap(), blocks);
+        drop(gone); // (outside the lock)
+    }
+}
+
+/// The blocks of `Constants` kept for use again: those of `CONSTANTS_BLOCK` bytes, up to
+/// `FREE_CONSTANTS_BYTES` of them; the others are returned to be released. Without a bound a
+/// burst of big slab constants stayed mapped for the rest of the process.
+fn keep_free_constants(free: &mut Vec<Constants>, blocks: Vec<Constants>) -> Vec<Constants> {
+    let mut kept: u64 = free.iter().map(|b| b.bytes).sum();
+    let mut gone = Vec::new();
+    for b in blocks {
+        if b.bytes == CONSTANTS_BLOCK && kept + b.bytes <= FREE_CONSTANTS_BYTES {
+            kept += b.bytes;
+            free.push(b);
+        } else {
+            gone.push(b);
+        }
+    }
+    gone
+}
+
+/// Memory the CPU writes the slabs' constants of direct dispatches in (`pso::record_dispatch_chain`):
+/// an allocator's recordings use a block of it until the allocator is reset, then other ones do.
+struct Constants {
+    buffer: ID3D12Resource,
+    device: usize,
+    cpu: usize,
+    bytes: u64,
+}
+
+/// allocator → its blocks and the bytes used of the last one
+static CONSTANTS: LazyLock<Mutex<HashMap<usize, (Vec<Constants>, u64)>>> = LazyLock::new(Default::default);
+static FREE_CONSTANTS: Mutex<Vec<Constants>> = Mutex::new(Vec::new());
+const CONSTANTS_BLOCK: u64 = 64 << 10;
+/// the most bytes of blocks kept for use again (`keep_free_constants`)
+const FREE_CONSTANTS_BYTES: u64 = 8 << 20;
+
+/// `bytes` of `Constants` for a dispatch recorded with `allocator`: their CPU and GPU addresses.
+unsafe fn constants_for(dev: &ID3D12Device, allocator: usize, bytes: u64) -> Option<(*mut u8, u64)> {
+    let mut all = CONSTANTS.lock().unwrap();
+    let (blocks, used) = all.entry(allocator).or_default();
+    if blocks.last().is_none_or(|b| *used + bytes > b.bytes) {
+        let device = dev.as_raw() as usize;
+        let free = {
+            let mut f = FREE_CONSTANTS.lock().unwrap();
+            f.iter().position(|b| b.device == device && b.bytes >= bytes).map(|k| f.swap_remove(k))
+        };
+        blocks.push(match free { Some(b) => b, None => constants_block(dev, bytes.max(CONSTANTS_BLOCK))? });
+        *used = 0;
+    }
+    let b = blocks.last()?;
+    let at = *used;
+    *used += bytes;
+    Some(((b.cpu as *mut u8).add(at as usize), b.buffer.GetGPUVirtualAddress() + at))
+}
+
+unsafe fn constants_block(dev: &ID3D12Device, bytes: u64) -> Option<Constants> {
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: bytes, Height: 1, DepthOrArraySize: 1, MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default()
+    };
+    let mut resource: Option<ID3D12Resource> = None;
+    dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, CreationNodeMask: 1, VisibleNodeMask: 1, ..Default::default() },
+        D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut resource).ok()?;
+    let buffer = resource?;
+    let mut cpu = std::ptr::null_mut();
+    buffer.Map(0, Some(&D3D12_RANGE::default()), Some(&mut cpu)).ok()?;
+    Some(Constants { buffer, device: dev.as_raw() as usize, cpu: cpu as usize, bytes })
 }
 
 #[cfg(test)]
@@ -474,7 +551,9 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
     let scratch = scratch_for(&chain.builder.device, list_key, if owned { 0 } else { allocator }, needed, group);
     let most = scratch.as_ref().map_or(1, |(s, _)| (s.bytes / group).max(1));
     let slabs = pso::dispatch_slabs(grid, most);
-    let Some((scratch, used)) = scratch else {
+    let constants = scratch.as_ref()
+        .and_then(|_| constants_for(&chain.builder.device, if owned { list_key } else { allocator }, slabs.len() as u64 * u64::from(pso::CHAIN_COMMAND_BYTES)));
+    let (Some((scratch, used)), Some(constants)) = (scratch, constants) else {
         list.SetPipelineState(&chain.whole()?);
         list.Dispatch(x, y, z);
         return Ok(());
@@ -489,7 +568,7 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
     }
     DISPATCHES.fetch_add(1, Ordering::Relaxed);
     SLABS.fetch_add(slabs.len() as u64, Ordering::Relaxed);
-    pso::record_dispatch_chain(list, grid, most, &held.scratch.buffer, used, std::iter::once(&held.first).chain(&held.chain.tail));
+    pso::record_dispatch_chain(list, grid, most, &held.scratch.buffer, used, constants, std::iter::once(&held.first).chain(&held.chain.tail));
     Ok(())
 }
 
@@ -515,7 +594,7 @@ fn indirect_rounds(seen: &[[u32; 3]], most: u64, before: Option<u32>, cap: u32) 
 /// rounds) until one was read back and its whole form is built, as slabs past the rounds are
 /// lost until then (one program's first ExecuteIndirects had a slab, a later one 22, #2404). Then
 /// the last one's, as more run the whole form: every round costs its pieces' ExecuteIndirects,
-/// also when empty (each ~14 us of GPU after its barrier on an RTX 5070 Ti, #2404).
+/// also when empty (each ~0.4 us of GPU after its barrier on an RTX 5070 Ti, #2404).
 fn slabs_before(measured: bool, whole: bool, last: u32) -> Option<u32> {
     (measured && whole).then_some(last)
 }
@@ -542,16 +621,12 @@ pub(in crate::hle::d3d12x) unsafe fn execute_indirect(list: &ID3D12GraphicsComma
     let group = u64::from(chain.words) * 4;
     let Some((scratch, _)) = scratch_for(dev, list.as_raw() as usize, allocator, scratch_budget(), group) else { return Ok(false) };
     let most = (scratch.bytes / group).max(1);
-    let sig = match chain.signature.get() {
-        Some(s) => s.clone(),
-        None => { let s = pso::chain_command_signature(dev, &chain.builder.signature)?; chain.signature.get_or_init(|| s).clone() }
-    };
-    let full = chain.whole.get().cloned().map(|p| pso::dispatch_command_signature(dev).map(|s| (p, s))).transpose()?;
+    let sig = pso::dispatch_command_signature(dev)?;
+    let full = chain.whole.get().cloned();
     let before = slabs_before(chain.measured.load(Ordering::Relaxed), full.is_some(), chain.last.load(Ordering::Relaxed));
     let rounds = indirect_rounds(seen, most, before, most_rounds());
-    let pieces = chain.tail.len() as u32 + 1;
-    let at = pso::chain_tail_offset(rounds, pieces);
-    let cmd_bytes = pooled_size(pso::chain_commands_bytes(rounds, pieces, commands));
+    let at = pso::chain_tail_offset(rounds);
+    let cmd_bytes = pooled_size(pso::chain_commands_bytes(rounds, commands));
     // a pooled buffer is in COMMON again (buffers decay when their command lists have run), so
     // the slicer's first write promotes it as it does a new one
     let (cmd_bytes, buffer) = match take_cmd_buffer(cmd_bytes) {
@@ -574,7 +649,7 @@ pub(in crate::hle::d3d12x) unsafe fn execute_indirect(list: &ID3D12GraphicsComma
         chain.want_whole();
     }
     let first = ID3D12PipelineState::from_raw_borrowed(&(pso as *mut c_void)).ok_or("first compute piece")?.clone();
-    pso::record_slicer(list, args, stride, commands, count, rounds, most, pieces, full.is_some(), &buffer)?;
+    pso::record_slicer(list, args, stride, commands, count, rounds, most, full.is_some(), &buffer)?;
     // the list uses `buffer` from here: the recording keeps it until the allocator is reset, also
     // when binding fails and nothing more is recorded
     let bound = bind();
@@ -582,9 +657,9 @@ pub(in crate::hle::d3d12x) unsafe fn execute_indirect(list: &ID3D12GraphicsComma
         // the slicer left either these arguments or the rounds empty. The whole form goes first
         // (each round's pieces start after a UAV barrier), with nothing of the chain before it:
         // after the pieces' ExecuteIndirects it did not run right on an RTX 3080 Ti (#2404)
-        if let Some((full, sig)) = &full {
+        if let Some(full) = &full {
             list.SetPipelineState(full);
-            list.ExecuteIndirect(sig, commands, &buffer, at + 16, None::<&ID3D12Resource>, 0);
+            list.ExecuteIndirect(&sig, commands, &buffer, at + 16, None::<&ID3D12Resource>, 0);
         }
         pso::record_dispatch_chain_indirect(list, &sig, &buffer, rounds, &scratch.buffer, std::iter::once(&first).chain(&chain.tail));
     }
@@ -599,7 +674,7 @@ pub(in crate::hle::d3d12x) unsafe fn execute_indirect(list: &ID3D12GraphicsComma
 #[cfg(test)]
 mod scratch_tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicU32};
+    use std::sync::atomic::AtomicBool;
 
     unsafe extern "system" fn no_create(_: *mut c_void, _: *const c_void, _: *const GUID, _: *mut *mut c_void) -> HRESULT {
         E_INVALIDARG
@@ -635,8 +710,8 @@ mod scratch_tests {
             std::mem::ManuallyDrop::drop(&mut desc.pRootSignature);
             let builder = Arc::new(PipelineBuilder { device: dev.clone(), create: no_create, signature: rs.clone(), flags: Default::default(), node: 0, record: 0 });
             let chain = Arc::new(Chain {
-                builder, tail: Vec::new(), words: 4, whole_code: Vec::new(), whole: OnceLock::new(), build_whole: Mutex::new(()),
-                signature: OnceLock::new(), slabs: AtomicU32::new(0), last: Default::default(), measured: Default::default(),
+                builder, tail: Vec::new(), words: 4, whole_code: Vec::new(), whole: OnceLock::new(), build_whole: Mutex::new(()), waiting: Default::default(),
+                last: Default::default(), measured: Default::default(),
                 wanted: AtomicBool::new(false), warned: AtomicBool::new(false),
             });
             let pso = first.clone().into_raw() as usize;
@@ -755,6 +830,45 @@ mod tests {
     }
 
     #[test]
+    fn direct_dispatches_write_their_constants_in_blocks_used_again_after_the_allocator_reset() {
+        use super::*;
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            }
+            let dev = dev.unwrap();
+            // allocators no list records with
+            let (a, b, c) = (usize::MAX - 2, usize::MAX - 1, usize::MAX);
+            let slab = u64::from(pso::CHAIN_COMMAND_BYTES);
+            let (cpu1, gpu1) = constants_for(&dev, a, 2 * slab).unwrap();
+            let (cpu2, gpu2) = constants_for(&dev, a, slab).unwrap();
+            assert_eq!((cpu2 as u64 - cpu1 as u64, gpu2 - gpu1), (2 * slab, 2 * slab));
+            assert_eq!(gpu1 % slab, 0);
+            // another allocator's dispatch gets other memory
+            let (_, gpu3) = constants_for(&dev, b, slab).unwrap();
+            assert!(gpu3 + slab <= gpu1 || gpu3 >= gpu1 + CONSTANTS_BLOCK);
+            // more than the rest of a block: another one, of its size
+            let (_, gpu4) = constants_for(&dev, a, CONSTANTS_BLOCK + slab).unwrap();
+            assert!(gpu4 + CONSTANTS_BLOCK + slab <= gpu1 || gpu4 >= gpu1 + CONSTANTS_BLOCK);
+            std::ptr::write_bytes(cpu1, 0xab, (2 * slab) as usize);
+            // reset, its blocks are used again
+            allocator_reset(a);
+            let mine = |g: u64| (gpu1..gpu1 + CONSTANTS_BLOCK).contains(&g) || (gpu4..gpu4 + CONSTANTS_BLOCK + slab).contains(&g);
+            let (_, again) = constants_for(&dev, c, CONSTANTS_BLOCK).unwrap();
+            assert!(mine(again), "{again:#x}");
+            // but not the bigger one, and no more than the budget
+            {
+                let free = FREE_CONSTANTS.lock().unwrap();
+                assert!(free.iter().all(|f| f.bytes == CONSTANTS_BLOCK), "a block bigger than {CONSTANTS_BLOCK} kept for use again");
+                assert!(free.iter().map(|f| f.bytes).sum::<u64>() <= FREE_CONSTANTS_BYTES);
+            }
+            allocator_reset(b);
+            allocator_reset(c);
+        }
+    }
+
+    #[test]
     fn a_chained_execute_indirect_keeps_its_commands_when_binding_fails() {
         use super::*;
         unsafe extern "system" fn never(_: *mut c_void, _: *const c_void, _: *const GUID, _: *mut *mut c_void) -> HRESULT { E_INVALIDARG }
@@ -773,13 +887,13 @@ mod tests {
             let builder = Arc::new(PipelineBuilder { device: dev.clone(), create: never, signature: rs.clone(), flags: D3D12_PIPELINE_STATE_FLAG_NONE, node: 0, record: 0 });
             let pso = first.as_raw() as usize;
             CHAINS.lock().unwrap().insert(pso, Arc::new(Chain { builder, tail: vec![first.clone()], words: 4, whole_code: Vec::new(), whole: OnceLock::new(),
-                build_whole: Mutex::new(()), waiting: Default::default(), signature: OnceLock::new(), last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() }));
+                build_whole: Mutex::new(()), waiting: Default::default(), last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() }));
             let ty = D3D12_COMMAND_LIST_TYPE_COMPUTE;
             let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
             let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, None).unwrap();
             let (raw_list, allocator) = (list.as_raw() as usize, alloc.as_raw() as usize);
             super::super::super::alloc_pool::created_on(raw_list, allocator, ty.0);
-            let args = pso::chain_commands_buffer(&dev, 1, 1, 1).unwrap();
+            let args = pso::chain_commands_buffer(&dev, 1, 1).unwrap();
             let r = execute_indirect(&list, pso, allocator, args.GetGPUVirtualAddress(), 12, 1, None, &[[1, 1, 1]], false,
                 || Err("unified memory is full".to_string()));
             assert_eq!(r, Err("unified memory is full".to_string()));
@@ -885,7 +999,7 @@ mod tests {
             let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
             code[..16].copy_from_slice(&nonce.to_le_bytes());
             let chain = Arc::new(Chain { builder, tail: Vec::new(), words: 4, whole_code: code, whole: OnceLock::new(),
-                build_whole: Mutex::new(()), waiting: Default::default(), signature: OnceLock::new(), last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() });
+                build_whole: Mutex::new(()), waiting: Default::default(), last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() });
             let held: Vec<_> = (0..huge_pso_concurrency()).map(|_| big_compile_turn(&BIG_COMPILES, || true, || false)).collect();
             chain.want_whole();
             let started = Instant::now();

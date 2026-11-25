@@ -854,7 +854,7 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
 /// methods at 124 / 125 (PC 77 / 78). The console-only methods in between: `list_x`.
 fn console_remap(kind: Kind) -> Vec<(usize, usize)> {
     match kind {
-        Kind::CommandList => (28..=31).map(|x| (x, x + 24)).chain((32..=55).map(|x| (x, x - 4))).chain((104..=109).map(|x| (x, x - 44))).chain([(124, 77), (125, 78)]).collect(),
+        Kind::CommandList => (28..=31).map(|x| (x, x + 24)).chain((32..=55).map(|x| (x, x - 4))).chain((104..=109).map(|x| (x, x - 44))).collect(),
         // the DMA list: Close / Reset, then the copy methods (XDefiant calls #12 with
         // CopyTextureRegion's arguments): 11–14 = PC 15–18 (CopyBufferRegion, CopyTextureRegion,
         // CopyResource, CopyTiles); what follows is not known yet (`console_extensions`)
@@ -968,6 +968,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
         // the title's calls from #14 on: Signal / Wait / … / SignalX / PresentX at the slots of
         // its runtime's layout (`queue_dispatch`)
         Kind::CommandQueue => QUEUE_SLOTS.iter().enumerate().map(|(k, &f)| (QUEUE_FIRST + k, f as usize)).collect(),
+        Kind::CommandAllocator => vec![(9, alloc_set_allocation_callback_x as usize)],
         Kind::DmaList => {
             use super::list_x as l;
             vec![(9, l::dma_close_x as usize), (10, l::reset_x as usize), (11, l::copy_buffer_region_x as usize), (12, l::copy_texture_region_x as usize), (13, l::copy_resource_x as usize)]
@@ -1023,11 +1024,13 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (61, l::fill32_x as usize),
                 (62, l::fill64_x as usize),
                 (63, l::fill128_x as usize),
+                (67, l::flush_pipeline_x as usize),
                 (68, l::set_depth_bounds_x as usize),
                 (69, l::write32_bottom_x as usize),
                 (70, l::write64_bottom_x as usize),
                 (71, l::wait32_x as usize),
                 (72, l::wait64_x as usize),
+                (73, l::set_pipeline_flag_x as usize),
                 (78, l::dispatch_x as usize),
                 (81, l::draw_indexed_x as usize),
                 (84, l::copy_resource_flags_x as usize),
@@ -1037,6 +1040,13 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (90, l::write32_bottom_of_shader_x as usize),
                 (93, l::kickoff_x as usize),
                 (94, l::set_depth_bias_x as usize),
+                (99, l::set_clear_batch_hint_x as usize),
+                (124, l::rs_set_shading_rate_x as usize),
+                (125, l::rs_set_shading_rate_image_x as usize),
+                // Flush{Gpu,Shader}CacheRangeX are called before device #133 sets QUEUE_SHIFTED
+                (131, l::flush_cache_range_x as usize),
+                (132, l::flush_cache_range_x as usize),
+                (140, l::set_quad_sample_mask_x as usize),
                 // console compute/BVH builder extensions (`XboxBvhBuilder.dll`)
                 (146, l::uav_barrier_x as usize),
                 (148, b::allocate_upload_memory as usize),
@@ -7005,6 +7015,17 @@ unsafe extern "system" fn q_release(this: *mut c_void) -> u32 {
     n
 }
 
+/// command allocator #9 SetAllocationCallbackX(callback, context): PC manages command allocator
+/// memory internally, so log once and succeed without retaining callback state.
+unsafe extern "system" fn alloc_set_allocation_callback_x(this: *mut c_void, _callback: usize, _context: usize) -> HRESULT {
+    if this.is_null() {
+        return E_INVALIDARG;
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| crate::xlog_info!("D3D12.X: CommandAllocator::SetAllocationCallbackX (#9) – ignored (PC allocator manages its own memory)"));
+    S_OK
+}
+
 unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
@@ -7077,7 +7098,12 @@ static QUEUE_OLDER: AtomicBool = AtomicBool::new(false);
 /// command list slots of the newer layout → the older layout's slot of the same method
 /// (`DispatchMesh` sits at newer #129 after #126 RSSetShadingRate, #127 RSSetShadingRateImage,
 /// and #128 Scarlett-only shading-rate/color struct; older #127, two slots before as the others).
-const NEWER_LIST_SLOTS: [(usize, usize); 22] = [(61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (70, 68), (71, 69), (72, 70), (73, 71), (74, 72), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94), (129, 127), (139, 10)];
+const NEWER_LIST_SLOTS: [(usize, usize); 28] = [
+    (61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (69, 67), (70, 68), (71, 69), (72, 70),
+    (73, 71), (74, 72), (75, 73), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88),
+    (91, 89), (92, 90), (95, 93), (96, 94), (101, 99), (126, 124), (127, 125), (129, 127),
+    (142, 140), (139, 10),
+];
 
 /// The title called device method `slot`, which only runtimes with the newer layouts have (a retail game
 /// records its first lists before any queue call could tell).
@@ -7096,8 +7122,8 @@ fn is_fence(p: usize) -> bool {
 const QUEUE_FIRST: usize = 14;
 
 /// A title's call of queue slot `slot` (arguments as integers; Signal / Wait / SignalX /
-/// PresentX / GetTimestampFrequency / GetClockCalibration / GetDesc all fit).
-unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
+/// PresentX / UpdatePageMappingsX / GetTimestampFrequency / GetClockCalibration / GetDesc all fit).
+unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> usize {
     const PC_SIGNAL: usize = 14;
     const PC_WAIT: usize = 15;
     const PC_TIMESTAMP_FREQUENCY: usize = 16;
@@ -7160,6 +7186,7 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
             f(this, a1)
         }
         23 => q_signal_x(this, a1 as *mut c_void, a2 as u64, a3 as u32) as u32 as usize,
+        29 => super::device_x::update_page_mappings_x(this, a1 as u32, a2 as *const u8, a3 as u64, a4 as u32, a5 as u32) as u32 as usize,
         30 => super::present::present_x(this, a1 as u32, a2 as *const u8, a3 as *const u8) as u32 as usize,
         // the newer layout's #35: ExecuteCommandListsX(count, lists, a value, flags) – a retail
         // game submits all its command lists this way (flags 3; 0 for the one it recorded at
@@ -7196,9 +7223,9 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
 macro_rules! queue_slots {
     ($($slot:literal),*) => {
         /// the title's entry for each queue slot from `QUEUE_FIRST`
-        static QUEUE_SLOTS: &[unsafe extern "system" fn(*mut c_void, usize, usize, usize, usize) -> usize] = &[$({
-            unsafe extern "system" fn f(this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
-                queue_dispatch($slot, this, a1, a2, a3, a4)
+        static QUEUE_SLOTS: &[unsafe extern "system" fn(*mut c_void, usize, usize, usize, usize, usize) -> usize] = &[$({
+            unsafe extern "system" fn f(this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> usize {
+                queue_dispatch($slot, this, a1, a2, a3, a4, a5)
             }
             f
         }),*];
@@ -7847,6 +7874,8 @@ mod queue_tests {
     use std::mem::{offset_of, size_of};
     use windows::Win32::Graphics::Direct3D12::ID3D12Fence_Vtbl;
 
+    static QUEUE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     // a fake adopted queue: the extension vtable's word before slot 0 points at the PC table
     unsafe extern "system" fn get_desc(_: *mut c_void, out: usize) -> usize {
         let d = [1u32, 2, 3, 4];
@@ -7885,6 +7914,7 @@ mod queue_tests {
     /// layout) it is GetDesc with all 16.
     #[test]
     fn queue_slot_18_before_the_layout_is_known_writes_8_bytes() {
+        let _guard = QUEUE_TEST_LOCK.lock().unwrap();
         const SLOT: usize = size_of::<usize>();
         let mut pc = [0usize; 32];
         pc[14] = signal as usize;
@@ -7905,15 +7935,76 @@ mod queue_tests {
         QUEUE_OLDER.store(false, Ordering::Release);
         unsafe {
             let mut out = [0xAAAA_AAAAu32; 4];
-            let r = queue_dispatch(18, this, out.as_mut_ptr() as usize, 0, 0, 0);
+            let r = queue_dispatch(18, this, out.as_mut_ptr() as usize, 0, 0, 0, 0);
             assert_eq!(r, out.as_ptr() as usize);
             assert_eq!(out, [1, 2, 0xAAAA_AAAA, 0xAAAA_AAAA], "only the first 8 bytes");
             FENCES.write().unwrap().push(fence);
-            queue_dispatch(14, this, fence, 1, 0, 0);
+            queue_dispatch(14, this, fence, 1, 0, 0, 0);
+            FENCES.write().unwrap().retain(|&f| f != fence);
             assert!(QUEUE_OLDER.load(Ordering::Acquire) && !QUEUE_SHIFTED.load(Ordering::Acquire));
             let mut out = [0xAAAA_AAAAu32; 4];
-            queue_dispatch(18, this, out.as_mut_ptr() as usize, 0, 0, 0);
+            queue_dispatch(18, this, out.as_mut_ptr() as usize, 0, 0, 0, 0);
             assert_eq!(out, [1, 2, 3, 4], "older layout: the whole description");
+        }
+    }
+
+    #[test]
+    fn queue_slot_31_on_newer_layout_dispatches_update_page_mappings() {
+        #[repr(C)]
+        struct Range {
+            op: u32,
+            idx: u32,
+            count: u32,
+        }
+        #[repr(C)]
+        struct Mapping {
+            dest_va: u64,
+            num_ranges: u32,
+            _pad: u32,
+            ranges: *const Range,
+        }
+        let _guard = QUEUE_TEST_LOCK.lock().unwrap();
+        let prev_shifted = QUEUE_SHIFTED.swap(true, Ordering::AcqRel);
+        let prev_older = QUEUE_OLDER.swap(false, Ordering::AcqRel);
+        let mut obj = [0usize];
+        let this = obj.as_mut_ptr() as *mut c_void;
+        let pool_base = 0x7_0000_0000u64;
+        let dest_base = 0x8_0000_0000u64;
+        let ranges = [Range { op: 1, idx: 2, count: 1 }];
+        let mapping = Mapping { dest_va: dest_base, num_ranges: 1, _pad: 0, ranges: ranges.as_ptr() };
+        unsafe {
+            let mut pool_id = u32::MAX;
+            assert_eq!(super::super::device_x::register_page_pool_x(std::ptr::null_mut(), pool_base, 8, &mut pool_id), S_OK);
+            let hr = queue_dispatch(31, this, 1, &mapping as *const _ as usize, pool_base as usize, 8, 0);
+            assert_eq!(hr as i32, S_OK);
+            let bad_hr = queue_dispatch(31, this, 1, 0, pool_base as usize, 8, 0);
+            assert_eq!(bad_hr as i32, E_INVALIDARG);
+            assert_eq!(super::super::device_x::unregister_page_pool_x(std::ptr::null_mut(), pool_id as u64), S_OK);
+        }
+        QUEUE_SHIFTED.store(prev_shifted, Ordering::Release);
+        QUEUE_OLDER.store(prev_older, Ordering::Release);
+    }
+
+    #[test]
+    fn allocator_slot_9_validates_this_and_returns_s_ok() {
+        let slots = console_slots(Kind::CommandAllocator);
+        assert_eq!(slots, vec![(9, alloc_set_allocation_callback_x as usize)]);
+        unsafe {
+            assert_eq!(alloc_set_allocation_callback_x(std::ptr::null_mut(), 0x1234, 0x5678), E_INVALIDARG);
+            let this = 0xDEAD_BEEFusize as *mut c_void;
+            assert_eq!(alloc_set_allocation_callback_x(this, 0x1234, 0x5678), S_OK);
+            assert_eq!(alloc_set_allocation_callback_x(this, 0, 0), S_OK);
+        }
+    }
+
+    #[test]
+    fn newer_list_slots_cover_shifted_console_methods() {
+        let slots = console_slots(Kind::CommandList);
+        for older in [67usize, 73, 99, 124, 125, 131, 132, 140] {
+            assert!(slots.iter().any(|&(s, _)| s == older), "missing older slot {older}");
+        }
+        for pair in [(69usize, 67usize), (75, 73), (101, 99), (126, 124), (127, 125), (142, 140)] {
+            assert!(NEWER_LIST_SLOTS.contains(&pair), "missing NEWER_LIST_SLOTS {pair:?}");
         }
     }
 

@@ -209,6 +209,10 @@ impl Drop for Recording {
 }
 
 static RECORDINGS: LazyLock<Mutex<HashMap<usize, Vec<Arc<Recording>>>>> = LazyLock::new(Default::default);
+/// Recordings of dispatches on a list with no title allocator (a bundle, or a list whose
+/// allocator XCL cannot see): their scratch lives until the title resets that list, which D3D12
+/// only allows after the GPU has finished the commands recorded in it.
+static LIST_RECORDINGS: LazyLock<Mutex<HashMap<usize, Vec<Arc<Recording>>>>> = LazyLock::new(Default::default);
 /// list → the allocator it records on and the scratch its chains share: they are dispatched one
 /// after another, with a barrier between them (the recordings keep it alive)
 static SHARED: LazyLock<Mutex<HashMap<usize, (usize, std::sync::Weak<Scratch>)>>> = LazyLock::new(Default::default);
@@ -216,6 +220,7 @@ static SHARED: LazyLock<Mutex<HashMap<usize, (usize, std::sync::Weak<Scratch>)>>
 /// `list` begins another recording, which the GPU may run beside the last one.
 pub(in crate::hle::d3d12x) fn list_reset(list: usize) {
     SHARED.lock().unwrap().remove(&list);
+    LIST_RECORDINGS.lock().unwrap().remove(&list);
 }
 
 /// `to` records right after `from` on the same allocator: its chains go on in `from`'s scratch.
@@ -297,8 +302,12 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
     let group = u64::from(chain.words) * 4;
     let needed = grid.into_iter().fold(group, |s, n| s.saturating_mul(n as u64));
     WANTED.fetch_max(needed, Ordering::Relaxed);
-    let scratch = (allocator != 0 && list.GetType() != D3D12_COMMAND_LIST_TYPE_BUNDLE)
-        .then(|| scratch_for(&chain.builder.device, list.as_raw() as usize, allocator, needed, group)).flatten();
+    let list_key = list.as_raw() as usize;
+    // No title allocator (a bundle, or a list whose allocator XCL cannot see): XCL owns the
+    // scratch and keeps it until the title resets the list (D3D12 allows a reset only after the
+    // GPU has finished the commands recorded in it), so the pieces run instead of the whole form.
+    let owned = allocator == 0 || list.GetType() == D3D12_COMMAND_LIST_TYPE_BUNDLE;
+    let scratch = scratch_for(&chain.builder.device, list_key, if owned { 0 } else { allocator }, needed, group);
     let most = scratch.as_ref().map_or(1, |(s, _)| (s.bytes / group).max(1));
     let slabs = pso::dispatch_slabs(grid, most);
     let Some((scratch, used)) = scratch else {
@@ -308,7 +317,11 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
     };
     let first = ID3D12PipelineState::from_raw_borrowed(&(pso as *mut c_void)).ok_or("first compute piece")?.clone();
     let held = Arc::new(Recording { scratch, first, chain, indirect: None });
-    RECORDINGS.lock().unwrap().entry(allocator).or_default().push(held.clone());
+    if owned {
+        LIST_RECORDINGS.lock().unwrap().entry(list_key).or_default().push(held.clone());
+    } else {
+        RECORDINGS.lock().unwrap().entry(allocator).or_default().push(held.clone());
+    }
     DISPATCHES.fetch_add(1, Ordering::Relaxed);
     SLABS.fetch_add(slabs.len() as u64, Ordering::Relaxed);
     pso::record_dispatch_chain(list, grid, most, &held.scratch.buffer, used, std::iter::once(&held.first).chain(&held.chain.tail));
@@ -396,6 +409,71 @@ pub(in crate::hle::d3d12x) unsafe fn execute_indirect(list: &ID3D12GraphicsComma
     bound?;
     INDIRECT.fetch_add(1, Ordering::Relaxed);
     Ok(true)
+}
+
+#[cfg(test)]
+mod scratch_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU32};
+
+    unsafe extern "system" fn no_create(_: *mut c_void, _: *const c_void, _: *const GUID, _: *mut *mut c_void) -> HRESULT {
+        E_INVALIDARG
+    }
+
+    /// A bundle (or a list with no title allocator) runs the already-compiled pieces with an
+    /// XCL-owned scratch, not the whole form; the scratch is released when the bundle is reset.
+    #[test]
+    fn a_bundle_dispatch_runs_the_pieces_with_an_xcl_scratch_not_the_whole_form() {
+        unsafe {
+            if crate::gpu::recomp::dxc::location().is_err() {
+                return crate::gpu::recomp::runner::skip_test("no DXC");
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let warp = CreateDXGIFactory1::<IDXGIFactory4>().and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>());
+                if let Ok(warp) = warp {
+                    let _ = D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev);
+                }
+            }
+            let Some(dev) = dev else { return crate::gpu::recomp::runner::skip_test("no D3D12 device") };
+            let dxil = crate::gpu::recomp::dxc::compile(
+                "RWByteAddressBuffer mem : register(u2); [numthreads(1,1,1)] void main() { mem.Store(0, 1); }",
+                "main", "cs_6_6", &[],
+            ).expect("DXC compile");
+            let rs = pso::dispatch_chain_root_signature(&dev, &[]).expect("dispatch chain RS");
+            let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const c_void, BytecodeLength: dxil.len() },
+                ..Default::default()
+            };
+            let first: ID3D12PipelineState = dev.CreateComputePipelineState(&desc).expect("CreateComputePipelineState");
+            std::mem::ManuallyDrop::drop(&mut desc.pRootSignature);
+            let builder = Arc::new(PipelineBuilder { device: dev.clone(), create: no_create, signature: rs.clone(), flags: Default::default(), node: 0, record: 0 });
+            let chain = Arc::new(Chain {
+                builder, tail: Vec::new(), words: 4, whole_code: Vec::new(), whole: OnceLock::new(), build_whole: Mutex::new(()),
+                signature: OnceLock::new(), slabs: AtomicU32::new(0), last: Default::default(), measured: Default::default(),
+                wanted: AtomicBool::new(false), warned: AtomicBool::new(false),
+            });
+            let pso = first.clone().into_raw() as usize;
+            CHAINS.lock().unwrap().insert(pso, chain.clone());
+
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE).expect("bundle allocator");
+            let bundle: ID3D12GraphicsCommandList = dev.CreateCommandList(
+                0,
+                D3D12_COMMAND_LIST_TYPE_BUNDLE,
+                &alloc,
+                Option::<&ID3D12PipelineState>::None,
+            ).expect("bundle");
+            bundle.SetComputeRootSignature(&rs);
+            assert!(dispatch(&bundle, pso, 0, [1, 1, 1]).is_ok(), "the bundle records the pieces");
+            assert!(LIST_RECORDINGS.lock().unwrap().get(&(bundle.as_raw() as usize)).is_some_and(|v| !v.is_empty()), "the scratch is kept with the bundle");
+            list_reset(bundle.as_raw() as usize);
+            assert!(!LIST_RECORDINGS.lock().unwrap().contains_key(&(bundle.as_raw() as usize)), "resetting the bundle releases its scratch");
+            drop(bundle);
+            drop(alloc);
+            forget(pso);
+        }
+    }
 }
 
 #[cfg(test)]

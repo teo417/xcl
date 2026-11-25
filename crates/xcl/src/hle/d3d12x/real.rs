@@ -5473,34 +5473,45 @@ unsafe fn own_stream(desc: *const c_void) -> Option<OwnedDesc> {
         return None;
     }
     let mut buf = std::slice::from_raw_parts(base as *const u8, size).to_vec();
+    let parsed = super::null::parse_stream(&buf, true);
+    if parsed.unknown.is_some() || parsed.truncated {
+        return None;
+    }
     let mut blobs: Vec<Vec<u8>> = Vec::new();
-    let mut off = 0usize;
-    while off + 8 <= size {
-        let ty = u32::from_le_bytes(buf[off..off + 4].try_into().ok()?);
-        let (psize, palign) = super::null::subobject_payload(ty)?;
-        let at = off.checked_add(if palign == 8 { 8 } else { 4 })?;
-        let end = at.checked_add(psize)?;
-        if end > size {
-            return None;
-        }
-        let word = |buf: &[u8], k: usize| u64::from_le_bytes(buf[at + 8 * k..at + 8 * k + 8].try_into().unwrap());
-        match ty {
-            1..=6 | 24 | 25 => {
-                let (p, n) = (word(&buf, 0) as usize, word(&buf, 1) as usize);
+    let mut shader_edits: Vec<(usize, usize, usize, bool)> = Vec::new();
+    let mut zero_ranges: Vec<(usize, usize)> = Vec::new();
+    for entry in &parsed.entries {
+        let at = entry.payload_offset;
+        let len = entry.payload.len();
+        match entry.desktop_ty {
+            Some(1..=6 | 24 | 25) => {
+                let p = u64::from_le_bytes(entry.payload[0..8].try_into().unwrap()) as usize;
+                let n = u64::from_le_bytes(entry.payload[8..16].try_into().unwrap()) as usize;
                 if p == 0 || n == 0 {
-                    buf[at..at + 16].fill(0);
+                    shader_edits.push((at, 0, 0, true));
                 } else if crate::gpu::shader::readable(p, n) {
+                    let idx = blobs.len();
                     blobs.push(std::slice::from_raw_parts(p as *const u8, n).to_vec());
-                    buf[at..at + 8].copy_from_slice(&(blobs.last().unwrap().as_ptr() as u64).to_le_bytes());
+                    shader_edits.push((at, idx, n, false));
                 } else {
                     return None;
                 }
             }
-            7 | 12 | 22 if buf[at..end].iter().any(|&b| b != 0) => return None,
-            19 => buf[at..at + 16].fill(0),
+            Some(7 | 12 | 22) if entry.payload.iter().any(|&b| b != 0) => return None,
+            Some(19) => zero_ranges.push((at, len)),
             _ => {}
         }
-        off = end.checked_add(7)? & !7;
+    }
+    drop(parsed);
+    for (at, idx, _, clear) in shader_edits {
+        if clear {
+            buf[at..at + 16].fill(0);
+        } else {
+            buf[at..at + 8].copy_from_slice(&(blobs[idx].as_ptr() as u64).to_le_bytes());
+        }
+    }
+    for (at, len) in zero_ranges {
+        buf[at..at + len].fill(0);
     }
     let d = Box::new([buf.len(), buf.as_ptr() as usize]);
     Some(OwnedDesc::Stream(d, buf, blobs))
@@ -5862,40 +5873,26 @@ impl StreamOut {
     }
 }
 
-/// The subobjects of a stream: (type, payload).
+/// The subobjects of a stream normalized to desktop D3D12 subobject types: (type, payload).
 fn stream_subobjects(buf: &[u8]) -> Option<Vec<(u32, &[u8])>> {
-    let mut out = Vec::new();
-    let mut off = 0usize;
-    while off + 8 <= buf.len() {
-        let ty = u32::from_le_bytes(buf[off..off + 4].try_into().ok()?);
-        let (psize, palign) = super::null::subobject_payload(ty)?;
-        let poff = if palign == 8 { 8 } else { 4 };
-        out.push((ty, buf.get(off + poff..off + poff + psize)?));
-        off += (poff + psize + 7) & !7;
+    let parsed = unsafe { super::null::parse_stream(buf, true) };
+    if parsed.unknown.is_some() || parsed.truncated {
+        return None;
     }
-    Some(out)
+    Some(parsed.entries.into_iter().filter_map(|e| e.desktop_ty.map(|ty| (ty, e.payload))).collect())
 }
 
-/// The stream's subobjects up to the first of a type XCL does not know (logged): a console
-/// shader in front of it must still be found.
+/// The stream's subobjects (normalized to desktop types) up to the first of a type XCL does not
+/// know (logged): a console shader in front of it must still be found.
 fn known_subobjects(buf: &[u8]) -> Vec<(u32, &[u8])> {
-    let mut out = Vec::new();
-    let mut off = 0usize;
-    while off + 8 <= buf.len() {
-        let ty = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
-        let Some((psize, palign)) = super::null::subobject_payload(ty) else {
-            static N: AtomicU64 = AtomicU64::new(0);
-            if N.fetch_add(1, Ordering::Relaxed) < 4 {
-                crate::xlog_warn!("D3D12.X: pipeline stream: unknown subobject type {ty} at {off:#x} of {:#x} - the rest is not read", buf.len());
-            }
-            break;
-        };
-        let poff = if palign == 8 { 8 } else { 4 };
-        let Some(p) = buf.get(off + poff..off + poff + psize) else { break };
-        out.push((ty, p));
-        off += (poff + psize + 7) & !7;
+    let parsed = unsafe { super::null::parse_stream(buf, true) };
+    if let Some((ty, off)) = parsed.unknown {
+        static N: AtomicU64 = AtomicU64::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 4 {
+            crate::xlog_warn!("D3D12.X: pipeline stream: unknown subobject type {ty} at {off:#x} of {:#x} - the rest is not read", buf.len());
+        }
     }
-    out
+    parsed.entries.into_iter().filter_map(|e| e.desktop_ty.map(|ty| (ty, e.payload))).collect()
 }
 
 unsafe fn payload_shader<'a>(p: &[u8]) -> Option<&'a [u8]> {
@@ -6069,6 +6066,48 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
     with_switch_fallback(|| translated_mesh_stream_once(this, desc, riid, ppv))
 }
 
+/// Copy fixed-function state subobjects valid on a PC mesh pipeline from `subs` into `out`
+/// (converting console formats and sanitizing integer-RT blending; omitting legacy shader,
+/// input-layout, strip-cut, stream-output, topology, root-signature, and cached-PSO entries).
+unsafe fn append_mesh_stream_state(out: &mut StreamOut, subs: &[(u32, &[u8])]) {
+    let mut rt_count = 0u32;
+    let mut rt_formats = [windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(0); 8];
+    if let Some((_, p)) = subs.iter().find(|(ty, p)| *ty == 15 && p.len() >= 36) {
+        for k in 0..8 {
+            let f = super::device_x::pc_target_format(u32::from_le_bytes(p[4 * k..4 * k + 4].try_into().unwrap()));
+            rt_formats[k] = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(f as i32);
+        }
+        rt_count = u32::from_le_bytes(p[32..36].try_into().unwrap());
+    }
+    for (ty, payload) in subs {
+        let keep = matches!(*ty, 8 | 9 | 10 | 11 | 15 | 16 | 17 | 18 | 20 | 21 | 22 | 26 | 27 | 28);
+        if !keep {
+            continue;
+        }
+        let (_, palign) = super::null::subobject_payload(*ty).unwrap_or((0, 4));
+        if *ty == 8 && payload.len() >= std::mem::size_of::<D3D12_BLEND_DESC>() {
+            let mut blend: D3D12_BLEND_DESC = std::ptr::read_unaligned(payload.as_ptr() as *const D3D12_BLEND_DESC);
+            sanitize_integer_rt_blend(&mut blend, rt_count, &rt_formats);
+            out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, &blend);
+            continue;
+        }
+        if (*ty == 15 && payload.len() >= 32) || (*ty == 16 && payload.len() >= 4) {
+            let mut p = payload.to_vec();
+            for k in 0..if *ty == 15 { 8 } else { 1 } {
+                let f = if *ty == 15 {
+                    super::device_x::pc_target_format(u32::from_le_bytes(p[4 * k..4 * k + 4].try_into().unwrap()))
+                } else {
+                    super::device_x::pc_view_format(u32::from_le_bytes(p[4 * k..4 * k + 4].try_into().unwrap()))
+                };
+                p[4 * k..4 * k + 4].copy_from_slice(&f.to_le_bytes());
+            }
+            out.raw(*ty, &p, palign == 8);
+            continue;
+        }
+        out.raw(*ty, payload, palign == 8);
+    }
+}
+
 unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
     use crate::gpu::recomp::pso::{console_mesh, is_console};
     if !crate::gpu::shader::readable(desc as usize, 16) {
@@ -6081,16 +6120,6 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
     let subs = stream_subobjects(std::slice::from_raw_parts(base as *const u8, size))?;
     let as_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32).and_then(|s| payload_shader(s.1));
     let ms_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).and_then(|s| payload_shader(s.1));
-    // A console MS container in the AS slot and no MS subobject (a retail game's minimap
-    // pipelines): refused. Translated as the mesh shader they are, the title rendered nothing
-    // from then on (a black screen every run); refused, it goes on to its menus. What it
-    // expects of them is not known yet.
-    if let (None, Some(a)) = (ms_slot, as_slot) {
-        if is_console(a) && crate::gpu::xbox::parse(a).is_some_and(|sh| sh.stage == "MS") {
-            note_translation_error(format!("mesh pipeline with its MS {:016x} in the AS slot – refused", crate::gpu::shader::fnv64(a)));
-            return Some(E_INVALIDARG);
-        }
-    }
     let ms = ms_slot?;
     if !is_console(ms) {
         return None;
@@ -6124,45 +6153,7 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
     let Some(rs) = abi_rs_for(this, &ps_samplers) else { return Some(E_INVALIDARG) };
     // the title's state (blend, rasteriser, depth, formats …) with XCL's RS and shaders
     let mut out = two_pass_mesh_stream(rs, &tp.ms, ps.as_deref());
-    // Extract PC-mapped render target formats upfront so BLEND (type 8) can be sanitized for
-    // integer RTVs regardless of subobject order in the stream.
-    let mut rt_count = 0u32;
-    let mut rt_formats = [windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(0); 8];
-    if let Some((_, p)) = subs.iter().find(|(ty, p)| *ty == 15 && p.len() >= 36) {
-        for k in 0..8 {
-            let f = super::device_x::pc_target_format(u32::from_le_bytes(p[4 * k..4 * k + 4].try_into().unwrap()));
-            rt_formats[k] = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(f as i32);
-        }
-        rt_count = u32::from_le_bytes(p[32..36].try_into().unwrap());
-    }
-    for (ty, payload) in &subs {
-        let skip = [0, 2, 14, 19, 24, 25].contains(ty); // RS, PS, topology, cached PSO, AS, MS
-        if !skip {
-            let (_, palign) = super::null::subobject_payload(*ty).unwrap_or((0, 4));
-            // BLEND: clear BlendEnable / LogicOpEnable on integer render targets (PC D3D12 rejects them)
-            if *ty == 8 && payload.len() >= std::mem::size_of::<D3D12_BLEND_DESC>() {
-                let mut blend: D3D12_BLEND_DESC = std::ptr::read_unaligned(payload.as_ptr() as *const D3D12_BLEND_DESC);
-                sanitize_integer_rt_blend(&mut blend, rt_count, &rt_formats);
-                out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, &blend);
-                continue;
-            }
-            // RENDER_TARGET_FORMATS, DEPTH_STENCIL_FORMAT: the console's formats as the PC's
-            if (*ty == 15 && payload.len() >= 32) || (*ty == 16 && payload.len() >= 4) {
-                let mut p = payload.to_vec();
-                for k in 0..if *ty == 15 { 8 } else { 1 } {
-                    let f = if *ty == 15 {
-                        super::device_x::pc_target_format(u32::from_le_bytes(p[4 * k..4 * k + 4].try_into().unwrap()))
-                    } else {
-                        super::device_x::pc_view_format(u32::from_le_bytes(p[4 * k..4 * k + 4].try_into().unwrap()))
-                    };
-                    p[4 * k..4 * k + 4].copy_from_slice(&f.to_le_bytes());
-                }
-                out.raw(*ty, &p, palign == 8);
-                continue;
-            }
-            out.raw(*ty, payload, palign == 8);
-        }
-    }
+    append_mesh_stream_state(&mut out, &subs);
     let hr = finish_two_pass(this, &out, tp, rs, "MS", riid, ppv);
     if hr >= 0 {
         super::dred::label(*ppv as usize, &[("ms", Some(ms)), ("ps", console_ps)]);
@@ -6245,77 +6236,67 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     hr
 }
 
-/// Rewrite a pipeline state stream with stand-in shaders. None if not possible.
+/// Rewrite a pipeline state stream with stand-in shaders (normalizing Xbox Series tags 23/24
+/// and 25..30 to desktop D3D12). None if not possible.
 unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
     let size = *(desc as *const usize);
     let base = *(desc.add(8) as *const usize);
     if !crate::gpu::shader::readable(base, size) {
         return None;
     }
-    let mut buf = std::slice::from_raw_parts(base as *const u8, size).to_vec();
+    let orig = std::slice::from_raw_parts(base as *const u8, size);
+    let subs = stream_subobjects(orig)?;
     let d = dummy();
-    let (mesh, rt_count, rt_formats) = {
-        let mut mesh = false;
-        let mut rt_count = 0u32;
-        let mut rt_formats = [windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(0); 8];
-        if let Some(subs) = stream_subobjects(&buf) {
-            mesh = subs.iter().any(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32);
-            if let Some((_, p)) = subs.iter().find(|(ty, p)| *ty == 15 && p.len() >= 36) {
+    let mesh = subs.iter().any(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32);
+    let mut rt_count = 0u32;
+    let mut rt_formats = [windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(0); 8];
+    if let Some((_, p)) = subs.iter().find(|(ty, p)| *ty == 15 && p.len() >= 36) {
+        for k in 0..8 {
+            let f = super::device_x::pc_target_format(u32::from_le_bytes(p[4 * k..4 * k + 4].try_into().unwrap()));
+            rt_formats[k] = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(f as i32);
+        }
+        rt_count = u32::from_le_bytes(p[32..36].try_into().unwrap());
+    }
+    let dm = if mesh { Some(dummy_mesh()?) } else { None };
+    let mut out = StreamOut::default();
+    for &(ty, payload) in &subs {
+        let (_, palign) = super::null::subobject_payload(ty).unwrap_or((payload.len(), 4));
+        match ty {
+            1 if mesh => {}
+            1 => out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, &d.vs),
+            2 => out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, dm.map_or(&d.ps[..], |m| &m.1[..])),
+            6 => out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, &d.cs),
+            3 | 4 | 5 | 24 if mesh => {}
+            3 | 4 | 5 | 24 => out.raw(ty, &[0u8; 16], true),
+            25 if mesh => out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &dm?.0),
+            25 => out.raw(ty, &[0u8; 16], true),
+            7 | 12 | 13 if mesh => {}
+            14 if mesh => out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE),
+            7 => out.raw(ty, &[0u8; 32], true),
+            12 => out.raw(ty, &[0u8; 16], true),
+            19 => out.raw(ty, &[0u8; 16], true),
+            8 if payload.len() >= std::mem::size_of::<D3D12_BLEND_DESC>() => {
+                let mut blend: D3D12_BLEND_DESC = std::ptr::read_unaligned(payload.as_ptr() as *const D3D12_BLEND_DESC);
+                sanitize_integer_rt_blend(&mut blend, rt_count, &rt_formats);
+                out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, &blend);
+            }
+            15 if payload.len() >= 32 => {
+                let mut p = payload.to_vec();
                 for k in 0..8 {
                     let f = super::device_x::pc_target_format(u32::from_le_bytes(p[4 * k..4 * k + 4].try_into().unwrap()));
-                    rt_formats[k] = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(f as i32);
+                    p[4 * k..4 * k + 4].copy_from_slice(&f.to_le_bytes());
                 }
-                rt_count = u32::from_le_bytes(p[32..36].try_into().unwrap());
+                out.raw(ty, &p, palign == 8);
             }
+            16 if payload.len() >= 4 => {
+                let f = super::device_x::pc_view_format(u32::from_le_bytes(payload[0..4].try_into().unwrap()));
+                out.raw(ty, &f.to_le_bytes(), false);
+            }
+            _ => out.raw(ty, payload, palign == 8),
         }
-        (mesh, rt_count, rt_formats)
-    };
-    let dm = if mesh { Some(dummy_mesh()?) } else { None };
-    let mut off = 0usize;
-    while off + 8 <= size {
-        let ty = u32::from_le_bytes(buf[off..off + 4].try_into().ok()?);
-        let (psize, palign) = super::null::subobject_payload(ty)?;
-        let poff = if palign == 8 { 8 } else { 4 };
-        let at = off + poff;
-        if at.checked_add(psize)? > size {
-            return None; // SizeInBytes ends inside the payload
-        }
-        let put = |buf: &mut Vec<u8>, b: &[u8]| {
-            // no shader: a null pointer – an empty slice's is dangling (0x1), which the driver
-            // refused (a retail game's mesh stand-ins, E_INVALIDARG)
-            let ptr = if b.is_empty() { 0 } else { b.as_ptr() as u64 };
-            buf[at..at + 8].copy_from_slice(&ptr.to_le_bytes());
-            buf[at + 8..at + 16].copy_from_slice(&(b.len() as u64).to_le_bytes());
-        };
-        match ty {
-            1 => put(&mut buf, &d.vs),
-            2 => put(&mut buf, dm.map_or(&d.ps[..], |m| &m.1[..])),
-            6 => put(&mut buf, &d.cs),
-            3 | 4 | 5 | 24 => put(&mut buf, &[]),
-            25 => put(&mut buf, &dm?.0),
-            8 if psize >= std::mem::size_of::<D3D12_BLEND_DESC>() => {
-                let mut blend: D3D12_BLEND_DESC = std::ptr::read_unaligned(buf[at..].as_ptr() as *const D3D12_BLEND_DESC);
-                sanitize_integer_rt_blend(&mut blend, rt_count, &rt_formats);
-                let bytes = std::slice::from_raw_parts(&blend as *const D3D12_BLEND_DESC as *const u8, std::mem::size_of::<D3D12_BLEND_DESC>());
-                buf[at..at + bytes.len()].copy_from_slice(bytes);
-            }
-            15 if psize >= 32 => {
-                for k in 0..8 {
-                    let f = super::device_x::pc_target_format(u32::from_le_bytes(buf[at + 4 * k..at + 4 * k + 4].try_into().unwrap()));
-                    buf[at + 4 * k..at + 4 * k + 4].copy_from_slice(&f.to_le_bytes());
-                }
-            }
-            16 if psize >= 4 => {
-                let f = super::device_x::pc_view_format(u32::from_le_bytes(buf[at..at + 4].try_into().unwrap()));
-                buf[at..at + 4].copy_from_slice(&f.to_le_bytes());
-            }
-            12 | 19 => buf[at..at + 16].fill(0), // input layout, cached PSO
-            7 => buf[at..at + 32].fill(0),        // stream output
-            _ => {}
-        }
-        off += (poff + psize + 7) & !7;
     }
-    Some((buf, [size, 0]))
+    let out_len = out.0.len();
+    Some((out.0, [out_len, 0]))
 }
 
 /// The console's pipeline topology type of rect lists (draws of topology 17, `list_x::RECT_LIST`).
@@ -8444,6 +8425,80 @@ mod mesh_stream_tests {
             // Case 2: caller passes ppv == null
             let hr = finish_two_pass(this, &stream, make_tp(), 0x1234_5678 as *mut c_void, "MS", &iid, std::ptr::null_mut());
             assert_eq!(hr, E_INVALIDARG);
+        }
+    }
+
+    #[test]
+    fn xbox_24_ms_stream_own_filter_and_standin() {
+        use crate::gpu::xbox::tests::{container, dxil_part, fssm, CODE};
+        let push_sub = |buf: &mut Vec<u8>, ty: u32, payload: &[u8], align: usize| {
+            buf.extend_from_slice(&ty.to_le_bytes());
+            if align == 8 {
+                buf.extend_from_slice(&0u32.to_le_bytes());
+            }
+            buf.extend_from_slice(payload);
+            while buf.len() % 8 != 0 {
+                buf.push(0);
+            }
+        };
+        let console_ms = container(&[(b"DXIL", &dxil_part(13, &[fssm(&CODE, &[(7, 0)])]))]);
+        let mut ms_bc = [0u8; 16];
+        ms_bc[0..8].copy_from_slice(&(console_ms.as_ptr() as usize).to_le_bytes());
+        ms_bc[8..16].copy_from_slice(&console_ms.len().to_le_bytes());
+
+        // Xbox-numbered stream: MS at 24, Xbox DS2 at 25 (non-zero bytes that must NOT be read as a
+        // shader pointer), legacy VS at 1, INPUT_LAYOUT at 12 (zeroed for own_stream test),
+        // D16_UNORM_S8_UINT (118) DSV format at 16, R8G8B8A8_UINT (30) RTV with blend enabled,
+        // and Xbox extension subobject 28.
+        let mut raw = Vec::new();
+        push_sub(&mut raw, 24, &ms_bc, 8);
+        push_sub(&mut raw, 25, &[0x11u8; 60], 4);
+        push_sub(&mut raw, 1, &[0u8; 16], 8);
+        push_sub(&mut raw, 12, &[0u8; 16], 8);
+        let mut rts = D3D12_RT_FORMAT_ARRAY::default();
+        rts.NumRenderTargets = 1;
+        rts.RTFormats[0] = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(30); // R8G8B8A8_UINT
+        let rts_bytes = unsafe { std::slice::from_raw_parts(&rts as *const _ as *const u8, std::mem::size_of_val(&rts)) };
+        push_sub(&mut raw, 15, rts_bytes, 4);
+        push_sub(&mut raw, 16, &118u32.to_le_bytes(), 4);
+        let mut blend = D3D12_BLEND_DESC::default();
+        blend.RenderTarget[0].BlendEnable = true.into();
+        let blend_bytes = unsafe { std::slice::from_raw_parts(&blend as *const _ as *const u8, std::mem::size_of_val(&blend)) };
+        push_sub(&mut raw, 8, blend_bytes, 4);
+        push_sub(&mut raw, 28, &3u32.to_le_bytes(), 4);
+
+        // 1. stream_subobjects normalizes 24->25, 25->26, drops 28.
+        let subs = stream_subobjects(&raw).expect("normalized stream");
+        let tys: Vec<u32> = subs.iter().map(|s| s.0).collect();
+        assert_eq!(tys, vec![25, 26, 1, 12, 15, 16, 8]);
+
+        // 2. own_stream copies MS from 24 and does NOT treat Xbox DS2 (25) as a shader pointer.
+        let d: [usize; 2] = [raw.len(), raw.as_ptr() as usize];
+        let owned = unsafe { own_stream(d.as_ptr() as *const c_void) }.expect("own_stream accepts xbox 24/25 stream");
+        let OwnedDesc::Stream(_, owned_buf, blobs) = owned else { panic!("expected Stream") };
+        assert_eq!(blobs, vec![console_ms.clone()]);
+        let owned_subs = stream_subobjects(&owned_buf).expect("re-parse owned xbox stream");
+        assert_eq!(owned_subs.iter().map(|s| s.0).collect::<Vec<_>>(), vec![25, 26, 1, 12, 15, 16, 8]);
+
+        // 3. append_mesh_stream_state keeps only valid mesh states, strips VS (1) & INPUT_LAYOUT (12),
+        // converts D16_UNORM_S8_UINT (118 -> 45), and disables blending on integer RTV.
+        let mut mesh_out = two_pass_mesh_stream(std::ptr::null_mut(), &[1, 2, 3, 4], None);
+        unsafe { append_mesh_stream_state(&mut mesh_out, &subs) };
+        let out_subs = stream_subobjects(&mesh_out.0).expect("mesh output stream");
+        let out_tys: Vec<u32> = out_subs.iter().map(|s| s.0).collect();
+        assert_eq!(out_tys, vec![0, 25, 14, 26, 15, 16, 8]);
+        let ds_fmt = out_subs.iter().find(|s| s.0 == 16).map(|s| u32::from_le_bytes(s.1[0..4].try_into().unwrap()));
+        assert_eq!(ds_fmt, Some(45), "D16_UNORM_S8_UINT maps to D24_UNORM_S8_UINT");
+        let out_blend = out_subs.iter().find(|s| s.0 == 8).unwrap().1;
+        let out_blend: D3D12_BLEND_DESC = unsafe { std::ptr::read_unaligned(out_blend.as_ptr() as *const D3D12_BLEND_DESC) };
+        assert!(!out_blend.RenderTarget[0].BlendEnable.as_bool(), "integer RTV blend sanitized");
+
+        // 4. fallback_stream (when DXC is present) builds a desktop MS (25) stand-in without VS/IL.
+        if crate::gpu::recomp::dxc::location().is_ok() {
+            let (standin, _) = unsafe { fallback_stream(d.as_ptr() as *const u8) }.expect("standin stream");
+            let standin_subs = stream_subobjects(&standin).expect("parse standin stream");
+            let standin_tys: Vec<u32> = standin_subs.iter().map(|s| s.0).collect();
+            assert_eq!(standin_tys, vec![25, 26, 15, 16, 8]);
         }
     }
 }

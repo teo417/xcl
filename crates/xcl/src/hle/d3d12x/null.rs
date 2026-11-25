@@ -333,7 +333,7 @@ pub unsafe fn capture_compute_desc(desc: *const u8) {
     }
 }
 
-/// (payload size, payload alignment) of D3D12_PIPELINE_STATE_SUBOBJECT_TYPE values.
+/// (payload size, payload alignment) of desktop D3D12_PIPELINE_STATE_SUBOBJECT_TYPE values.
 pub fn subobject_payload(ty: u32) -> Option<(usize, usize)> {
     Some(match ty {
         0 => (8, 8),                          // ROOT_SIGNATURE
@@ -355,6 +355,113 @@ pub fn subobject_payload(ty: u32) -> Option<(usize, usize)> {
     })
 }
 
+/// (payload size, payload alignment) of Xbox Series D3D12_PIPELINE_STATE_SUBOBJECT_TYPE values.
+/// Console kits number AS=23 and MS=24 (no gap at 23), shifting 25..27 down by 1 and placing
+/// Xbox-only extension subobjects at 28..30.
+pub fn subobject_payload_xbox(ty: u32) -> Option<(usize, usize)> {
+    Some(match ty {
+        0..=22 => return subobject_payload(ty),
+        23 | 24 => (16, 8), // AS, MS
+        25 => (60, 4),      // DEPTH_STENCIL2
+        26 => (44, 4),      // RASTERIZER1
+        27 => (40, 4),      // RASTERIZER2
+        28..=30 => (4, 4),  // Xbox extension flags
+        _ => return None,
+    })
+}
+
+/// Map an Xbox Series subobject tag to its desktop D3D12 equivalent (`None` for Xbox-only extensions).
+pub fn xbox_to_desktop_subobject(raw_ty: u32) -> Option<u32> {
+    match raw_ty {
+        0..=22 => Some(raw_ty),
+        23 => Some(24),     // AS
+        24 => Some(25),     // MS
+        25 => Some(26),     // DEPTH_STENCIL2
+        26 => Some(27),     // RASTERIZER1
+        27 => Some(28),     // RASTERIZER2
+        28..=30 => None,    // Xbox-only extension subobjects
+        _ => Some(raw_ty),
+    }
+}
+
+/// True when `blob` is a mesh shader container (console RDNA2 MS or DXBC PSV0 ShaderStage == 13).
+pub fn is_mesh_shader_blob(blob: &[u8]) -> bool {
+    crate::gpu::xbox::parse(blob).is_some_and(|sh| sh.stage == "MS")
+        || crate::gpu::dxbc::psv(blob).is_some_and(|p| p.kind == Some(13))
+}
+
+/// One parsed subobject entry from a pipeline state stream.
+pub struct ParsedSubobject<'a> {
+    pub raw_ty: u32,
+    pub desktop_ty: Option<u32>,
+    pub payload_offset: usize,
+    pub payload: &'a [u8],
+}
+
+/// Result of parsing a pipeline state stream with Xbox Series tag disambiguation.
+pub struct ParsedStream<'a> {
+    pub entries: Vec<ParsedSubobject<'a>>,
+    pub xbox_tags: bool,
+    pub unknown: Option<(u32, usize)>,
+    pub truncated: bool,
+}
+
+/// Walk `buf` as a D3D12 pipeline state stream, detecting Xbox Series numbering when tag 23
+/// (AS) appears or (if `probe_shader`) tag 24 carries a mesh shader blob.
+pub unsafe fn parse_stream(buf: &[u8], probe_shader: bool) -> ParsedStream<'_> {
+    let mut entries = Vec::new();
+    let mut xbox_tags = false;
+    let mut unknown = None;
+    let mut truncated = false;
+    let mut off = 0usize;
+    while off + 8 <= buf.len() {
+        let raw_ty = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+        if raw_ty == 23 {
+            xbox_tags = true;
+        } else if raw_ty == 24 && !xbox_tags && probe_shader {
+            if let Some(p) = buf.get(off + 8..off + 24) {
+                let ptr = u64::from_le_bytes(p[0..8].try_into().unwrap()) as usize;
+                let len = u64::from_le_bytes(p[8..16].try_into().unwrap()) as usize;
+                if ptr != 0 && len != 0 && crate::gpu::shader::readable(ptr, len) {
+                    let blob = std::slice::from_raw_parts(ptr as *const u8, len);
+                    if is_mesh_shader_blob(blob) {
+                        xbox_tags = true;
+                    }
+                }
+            }
+        }
+        let layout = if xbox_tags {
+            subobject_payload_xbox(raw_ty)
+        } else if matches!(raw_ty, 29 | 30) {
+            Some((4, 4))
+        } else {
+            subobject_payload(raw_ty)
+        };
+        let Some((psize, palign)) = layout else {
+            unknown = Some((raw_ty, off));
+            break;
+        };
+        let poff = if palign == 8 { 8 } else { 4 };
+        let Some(payload) = buf.get(off + poff..off + poff + psize) else {
+            truncated = true;
+            break;
+        };
+        let desktop_ty = if xbox_tags || matches!(raw_ty, 29 | 30) {
+            xbox_to_desktop_subobject(raw_ty)
+        } else {
+            Some(raw_ty)
+        };
+        entries.push(ParsedSubobject {
+            raw_ty,
+            desktop_ty,
+            payload_offset: off + poff,
+            payload,
+        });
+        off += (poff + psize + 7) & !7;
+    }
+    ParsedStream { entries, xbox_tags, unknown, truncated }
+}
+
 /// D3D12_PIPELINE_STATE_STREAM_DESC { SIZE_T SizeInBytes; void* pPipelineStateSubobjectStream; }
 pub unsafe fn capture_stream_desc(desc: *const u8) {
     if !crate::gpu::shader::readable(desc as usize, 16) {
@@ -365,32 +472,26 @@ pub unsafe fn capture_stream_desc(desc: *const u8) {
     if !crate::gpu::shader::readable(base, size) {
         return;
     }
-    let mut off = 0usize;
-    while off + 8 <= size {
-        let ty = *((base + off) as *const u32);
-        let Some((psize, palign)) = subobject_payload(ty) else {
-            crate::xlog_debug!("[SHADER] PSO stream: unknown subobject type {ty} – stopping the parse");
-            break;
-        };
-        let poff = if palign == 8 { 8 } else { 4 };
-        if off + poff + psize > size {
-            break; // SizeInBytes ends inside the payload
-        }
-        let stage = match ty {
-            1 => Some("vs"),
-            2 => Some("ps"),
-            3 => Some("ds"),
-            4 => Some("hs"),
-            5 => Some("gs"),
-            6 => Some("cs"),
-            24 => Some("as"),
-            25 => Some("ms"),
+    let buf = std::slice::from_raw_parts(base as *const u8, size);
+    let parsed = parse_stream(buf, true);
+    for entry in &parsed.entries {
+        let stage = match entry.desktop_ty {
+            Some(1) => Some("vs"),
+            Some(2) => Some("ps"),
+            Some(3) => Some("ds"),
+            Some(4) => Some("hs"),
+            Some(5) => Some("gs"),
+            Some(6) => Some("cs"),
+            Some(24) => Some("as"),
+            Some(25) => Some("ms"),
             _ => None,
         };
         if let Some(s) = stage {
-            capture_bytecode(s, (base + off + poff) as *const u8);
+            capture_bytecode(s, entry.payload.as_ptr());
         }
-        off += (poff + psize + 7) & !7;
+    }
+    if let Some((ty, _)) = parsed.unknown {
+        crate::xlog_debug!("[SHADER] PSO stream: unknown subobject type {ty} – stopping the parse");
     }
 }
 
@@ -968,5 +1069,84 @@ mod tests {
             clobber_abi("system"),
         );
         ret
+    }
+
+    #[test]
+    fn xbox_subobject_tags_disambiguate_23_24_and_extensions() {
+        use crate::gpu::xbox::tests::{container, dxil_part, fssm, CODE};
+        let push_sub = |buf: &mut Vec<u8>, ty: u32, payload: &[u8], align: usize| {
+            buf.extend_from_slice(&ty.to_le_bytes());
+            if align == 8 {
+                buf.extend_from_slice(&0u32.to_le_bytes());
+            }
+            buf.extend_from_slice(payload);
+            while buf.len() % 8 != 0 {
+                buf.push(0);
+            }
+        };
+        let bc = |b: &[u8]| {
+            let mut v = [0u8; 16];
+            v[0..8].copy_from_slice(&(b.as_ptr() as usize).to_le_bytes());
+            v[8..16].copy_from_slice(&b.len().to_le_bytes());
+            v
+        };
+        let console_ms = container(&[(b"DXIL", &dxil_part(13, &[fssm(&CODE, &[(7, 0)])]))]);
+        let console_as = container(&[(b"DXIL", &dxil_part(14, &[fssm(&CODE, &[(6, 0)])]))]);
+        assert!(is_mesh_shader_blob(&console_ms));
+        assert!(!is_mesh_shader_blob(&console_as));
+
+        // Case 1: Xbox Series stream with MS in subobject 24 (no 23, no 25), plus Xbox DS2 (25),
+        // RAST1 (26), RAST2 (27), and Xbox extension flag (28).
+        let mut s_xbox_ms = Vec::new();
+        push_sub(&mut s_xbox_ms, 24, &bc(&console_ms), 8);
+        push_sub(&mut s_xbox_ms, 25, &[0xA5u8; 60], 4);
+        push_sub(&mut s_xbox_ms, 26, &[0xB6u8; 44], 4);
+        push_sub(&mut s_xbox_ms, 27, &[0xC7u8; 40], 4);
+        push_sub(&mut s_xbox_ms, 28, &0xDEAD_BEEFu32.to_le_bytes(), 4);
+        let parsed = unsafe { parse_stream(&s_xbox_ms, true) };
+        assert!(parsed.xbox_tags && parsed.unknown.is_none() && !parsed.truncated);
+        let mapped: Vec<(u32, Option<u32>, usize)> = parsed
+            .entries
+            .iter()
+            .map(|e| (e.raw_ty, e.desktop_ty, e.payload.len()))
+            .collect();
+        assert_eq!(
+            mapped,
+            vec![
+                (24, Some(25), 16),
+                (25, Some(26), 60),
+                (26, Some(27), 44),
+                (27, Some(28), 40),
+                (28, None, 4),
+            ]
+        );
+
+        // Case 2: Xbox Series stream starting with AS at 23 -> triggers xbox_tags even with null MS.
+        let mut s_xbox_as = Vec::new();
+        push_sub(&mut s_xbox_as, 23, &bc(&console_as), 8);
+        push_sub(&mut s_xbox_as, 24, &bc(&console_ms), 8);
+        push_sub(&mut s_xbox_as, 29, &7u32.to_le_bytes(), 4);
+        let parsed_as = unsafe { parse_stream(&s_xbox_as, true) };
+        assert!(parsed_as.xbox_tags && parsed_as.unknown.is_none() && !parsed_as.truncated);
+        let mapped_as: Vec<(u32, Option<u32>)> = parsed_as
+            .entries
+            .iter()
+            .map(|e| (e.raw_ty, e.desktop_ty))
+            .collect();
+        assert_eq!(mapped_as, vec![(23, Some(24)), (24, Some(25)), (29, None)]);
+
+        // Case 3: Desktop stream with AS at 24 (not an MS container) and MS at 25 keeps desktop tags.
+        let mut s_desktop = Vec::new();
+        push_sub(&mut s_desktop, 24, &bc(&console_as), 8);
+        push_sub(&mut s_desktop, 25, &bc(&console_ms), 8);
+        push_sub(&mut s_desktop, 26, &[0x55u8; 60], 4);
+        let parsed_desk = unsafe { parse_stream(&s_desktop, true) };
+        assert!(!parsed_desk.xbox_tags && parsed_desk.unknown.is_none() && !parsed_desk.truncated);
+        let mapped_desk: Vec<(u32, Option<u32>, usize)> = parsed_desk
+            .entries
+            .iter()
+            .map(|e| (e.raw_ty, e.desktop_ty, e.payload.len()))
+            .collect();
+        assert_eq!(mapped_desk, vec![(24, Some(24), 16), (25, Some(25), 16), (26, Some(26), 60)]);
     }
 }

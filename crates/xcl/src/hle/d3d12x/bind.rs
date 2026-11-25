@@ -899,7 +899,7 @@ unsafe fn chained_indirect(this: *mut c_void, list: &ID3D12GraphicsCommandList, 
     let n = if count_buf == 0 { max } else { read(count_buf, count_title, 1).map_or(max, |c| c[0].min(max)) };
     let seen: Vec<[u32; 3]> = (0..n.min(64)).filter_map(|k| read(args, args_title + u64::from(k * stride), 3)).map(|v| [v[0], v[1], v[2]]).collect();
     super::real::dispatch_chain::execute_indirect(list, pso, with(this, |s| s.allocator), args_va, stride, max, count_va, &seen,
-        || bind_abi(this, list, pso, false))
+        super::list_x::predicated(this), || bind_abi(this, list, pso, false))
 }
 
 /// The GPU address of a title's buffer `res` at its offset `title` (a buffer in unified memory) or

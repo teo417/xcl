@@ -3351,6 +3351,12 @@ pub(super) fn on_pc_reset(list: *mut c_void) {
     }
 }
 
+/// The title's predication (`SetPredicationBufferX`) is set on `list`: what it records now may not run.
+pub(super) fn predicated(list: *mut c_void) -> bool {
+    PREDICATION_USED.load(Ordering::Acquire)
+        && LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).is_some_and(|s| s.predication.is_some())
+}
+
 /// Copy 8 predicate bytes from `(uma_buf, off)` into `pb` with exact barrier transitions and
 /// bind `SetPredication(pb, 0, op)` on `this`.
 unsafe fn apply_predication_copy(this: *mut c_void, uma_buf: usize, off: u64, pb: usize, op: D3D12_PREDICATION_OP) {
@@ -6037,6 +6043,7 @@ mod tests {
                     PredEvent::SetPred(pb_raw, 0, D3D12_PREDICATION_OP_EQUAL_ZERO),
                 ]
             );
+            assert!(predicated(list_ptr));
 
             // Rejections while a predicate is active must neither emit events nor disturb tracked state.
             for ty in [D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_COMPUTE] {
@@ -6109,11 +6116,14 @@ mod tests {
             );
             set_predication_buffer_x(list_ptr, std::ptr::null());
             assert_eq!(take_events(), vec![PredEvent::SetPred(0, 0, D3D12_PREDICATION_OP_EQUAL_ZERO)]);
+            assert!(!predicated(list_ptr));
 
             // (g) on_pc_reset clears predication & pred_in_state so subsequent before_close emits 0 barriers.
             apply_predication_copy(list_ptr, uma_buf, 0x100, pb_raw, D3D12_PREDICATION_OP_EQUAL_ZERO);
             take_events();
+            assert!(predicated(list_ptr));
             on_pc_reset(list_ptr);
+            assert!(!predicated(list_ptr));
             before_close(list_ptr);
             assert!(take_events().is_empty(), "on_pc_reset must clear pred_in_state before before_close");
         }

@@ -169,7 +169,8 @@ struct Indirect {
     at: u64,
     rounds: u32,
     /// the whole form ran instead (the slicer gave it the arguments); `checked`: the chain was
-    /// recorded (under the title's predication the slicer may not run: its words stay 0)
+    /// recorded and the title's predication was not set (it may skip the slicer, whose words are
+    /// then no count)
     whole: bool,
     checked: bool,
 }
@@ -333,11 +334,12 @@ fn indirect_rounds(seen: &[[u32; 3]], most: u64, before: Option<u32>, cap: u32) 
 /// bytes: `commands` of them at GPU address `args` (their count at `count`, when given), run as
 /// the chain. `seen`: the arguments the CPU sees there now. `bind` binds the ABI after the
 /// slicer. The whole form (built already) runs instead when the arguments have more slabs than
-/// the rounds, also under the title's predication (which then holds for the slicer too).
+/// the rounds, also under the title's predication (`predicated`, which then holds for the slicer
+/// too).
 /// Ok(false): nothing recorded (no chain, a bundle, no scratch) – the caller runs the whole form.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::hle::d3d12x) unsafe fn execute_indirect(list: &ID3D12GraphicsCommandList, pso: usize, allocator: usize, args: u64, stride: u32,
-    commands: u32, count: Option<u64>, seen: &[[u32; 3]], bind: impl FnOnce() -> Result<(), String>) -> Result<bool, String> {
+    commands: u32, count: Option<u64>, seen: &[[u32; 3]], predicated: bool, bind: impl FnOnce() -> Result<(), String>) -> Result<bool, String> {
     let chain = CHAINS.lock().unwrap().get(&pso).cloned();
     let Some(chain) = chain else { return Ok(false) };
     let allocator = if super::super::alloc_pool::enabled() {
@@ -378,7 +380,7 @@ pub(in crate::hle::d3d12x) unsafe fn execute_indirect(list: &ID3D12GraphicsComma
         }
         pso::record_dispatch_chain_indirect(list, &sig, &buffer, rounds, &scratch.buffer, std::iter::once(&first).chain(&chain.tail));
     }
-    let indirect = Indirect { commands: buffer, at, rounds, whole: full.is_some(), checked: bound.is_ok() };
+    let indirect = Indirect { commands: buffer, at, rounds, whole: full.is_some(), checked: bound.is_ok() && !predicated };
     RECORDINGS.lock().unwrap().entry(allocator).or_default().push(Arc::new(Recording { scratch, first, chain, indirect: Some(indirect) }));
     bound?;
     INDIRECT.fetch_add(1, Ordering::Relaxed);
@@ -490,15 +492,20 @@ mod tests {
             let (raw_list, allocator) = (list.as_raw() as usize, alloc.as_raw() as usize);
             super::super::super::alloc_pool::created_on(raw_list, allocator, ty.0);
             let args = pso::chain_commands_buffer(&dev, 1, 1, 1).unwrap();
-            let r = execute_indirect(&list, pso, allocator, args.GetGPUVirtualAddress(), 12, 1, None, &[[1, 1, 1]],
+            let r = execute_indirect(&list, pso, allocator, args.GetGPUVirtualAddress(), 12, 1, None, &[[1, 1, 1]], false,
                 || Err("unified memory is full".to_string()));
             assert_eq!(r, Err("unified memory is full".to_string()));
             // the program's first ExecuteIndirect asks for its whole form, before any slab is lost
             assert!(CHAINS.lock().unwrap()[&pso].wanted.load(Ordering::Relaxed));
             // the slicer's dispatch is recorded: its command buffer lives until the allocator is
             // reset, and the read-back does not take the rounds that were not recorded
+            // under the title's predication the slicer may not run, so its words are not read back
+            // (reported by @thehollowedone, #2404); without it they are
+            for predicated in [true, false] {
+                assert_eq!(execute_indirect(&list, pso, allocator, args.GetGPUVirtualAddress(), 12, 1, None, &[[1, 1, 1]], predicated, || Ok(())), Ok(true));
+            }
             let kept = RECORDINGS.lock().unwrap().get(&allocator).map(|v| v.iter().filter_map(|r| r.indirect.as_ref().map(|i| i.checked)).collect::<Vec<_>>());
-            assert_eq!(kept, Some(vec![false]));
+            assert_eq!(kept, Some(vec![false, false, true]));
             list.Close().unwrap();
             allocator_reset(allocator);
             list_reset(raw_list);

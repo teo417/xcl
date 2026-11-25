@@ -86,15 +86,130 @@ const DRAWS_PC: usize = 2;
 const DISPATCHES: usize = 3;
 const DISPATCHES_SKIPPED: usize = 4;
 
+/// graphics draws left to the stand-in of a pipeline still being built (also in `DRAWS_PC`)
+static STANDIN_DRAWS: AtomicU64 = AtomicU64::new(0);
+
+/// (draws skipped, draws left to a stand-in, dispatches skipped), for `XCL_ACTIVITY`.
+pub fn skipped_activity() -> [u64; 3] {
+    [COUNTS[DRAWS_SKIPPED].load(Ordering::Relaxed), STANDIN_DRAWS.load(Ordering::Relaxed), COUNTS[DISPATCHES_SKIPPED].load(Ordering::Relaxed)]
+}
+
+/// Why a draw or dispatch of console code was skipped. `DRAWS_SKIPPED` and `DISPATCHES_SKIPPED`
+/// stay the totals (an indirect dispatch of a pipeline still building has always counted as a
+/// draw); each skip adds to one of these as well.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Cause {
+    /// the pipeline was still being built (or late) at record time and the call was not put off
+    /// to the submit, for no reason below
+    Building,
+    /// … it was in a bundle
+    BuildingBundle,
+    /// … the list was predicated
+    BuildingPredicated,
+    /// … the recording had used up its extra segments
+    BuildingNoSegments,
+    /// … the list has no wrapper to hold segments
+    BuildingNoWrapper,
+    /// … making the segment failed (no allocator, Close, CreateCommandList)
+    BuildingPutOffFailed,
+    /// put off, but the stand-in was released before the submit
+    Released,
+    /// the pipeline build failed
+    BuildFailed,
+    /// a console compute pipeline with no translation and no build behind it
+    NoTranslation,
+    /// a put-off dispatch that could not be recorded (no allocator, Reset failed)
+    Dropped,
+    /// a two-pass MS/GS pipeline, which a draw or ExecuteIndirect cannot use
+    TwoPass,
+    /// a translated draw whose arguments could not be bound
+    DrawError,
+    /// a translated dispatch whose arguments could not be bound
+    DispatchError,
+}
+const CAUSE_NAMES: [&str; 13] = [
+    "building",
+    "building: bundle",
+    "building: predicated",
+    "building: no segments left",
+    "building: no wrapper",
+    "building: put-off failed",
+    "released before submit",
+    "build failed",
+    "no translation",
+    "dropped at submit",
+    "two-pass pipeline",
+    "draw not bound",
+    "dispatch not bound",
+];
+static CAUSE_COUNTS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
+
+/// Counts a skipped draw or dispatch (`total`: `DRAWS_SKIPPED` / `DISPATCHES_SKIPPED`) under `cause`.
+fn skip(total: usize, cause: Cause) {
+    CAUSE_COUNTS[cause as usize].fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    LOCAL.with(|l| l.borrow_mut().1[cause as usize] += 1);
+    count(total);
+}
+
+/// "; skipped by cause: a N, b N" for the non-zero ones, "" if none.
+fn causes_line(c: &[u64]) -> String {
+    let parts: Vec<String> = CAUSE_NAMES.iter().zip(c).filter(|(_, &n)| n > 0).map(|(name, n)| format!("{name} {n}")).collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("; skipped by cause: {}", parts.join(", "))
+    }
+}
+
+thread_local! {
+    /// this thread records put-off calls at the submit (`list_x::record_deferred`)
+    static AT_SUBMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f`, a put-off call being recorded at the submit.
+pub(super) fn at_submit<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            AT_SUBMIT.set(self.0);
+        }
+    }
+    let _restore = Restore(AT_SUBMIT.replace(true));
+    f()
+}
+
+/// Why a console compute call with the pipeline `raw_pso` has nothing to run. `refused` (why it
+/// could not be put off, when that was tried) wins: it was true before the call waited for the
+/// build, and the state read after the wait says nothing about it.
+fn unbuilt_cause(raw_pso: usize, refused: Option<Cause>) -> Cause {
+    use super::pso_async::BuildState;
+    if let Some(why) = refused {
+        return why;
+    }
+    match super::pso_async::build_state(raw_pso) {
+        BuildState::Building => Cause::Building,
+        BuildState::Failed => Cause::BuildFailed,
+        // built, but not into a translated pipeline
+        BuildState::Built => Cause::NoTranslation,
+        // no stand-in: put off to the submit, the title released it by then; else there never was a build
+        BuildState::Untracked if AT_SUBMIT.get() => Cause::Released,
+        BuildState::Untracked => Cause::NoTranslation,
+    }
+}
+
 fn count(k: usize) {
     let n = COUNTS[k].fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(test)]
+    LOCAL.with(|l| l.borrow_mut().0[k] += 1);
     if n.is_power_of_two() && n >= 64 {
         let c: Vec<u64> = COUNTS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+        let causes = causes_line(&CAUSE_COUNTS.iter().map(|c| c.load(Ordering::Relaxed)).collect::<Vec<u64>>());
         let (allocators, blocks) = console_list::pending_blocks();
         let (coherent_used, coherent_total, sparse_used) = crate::gpu::uma::get()
             .map_or((0, 0, 0), |u| (u.used() >> 20, u.size() >> 20, u.sparse_used() >> 20));
         crate::xlog_info!(
-            "D3D12.X: console code so far: {} draws with translated pipelines ({} skipped, {} with PC pipelines), {} dispatches ({} skipped); coherent {coherent_used}/{coherent_total} MB, sparse {sparse_used} MB, {blocks} blocks held for {allocators} allocators",
+            "D3D12.X: console code so far: {} draws with translated pipelines ({} skipped, {} with PC pipelines), {} dispatches ({} skipped){causes}; coherent {coherent_used}/{coherent_total} MB, sparse {sparse_used} MB, {blocks} blocks held for {allocators} allocators",
             c[DRAWS], c[DRAWS_SKIPPED], c[DRAWS_PC], c[DISPATCHES], c[DISPATCHES_SKIPPED],
         );
     }
@@ -169,7 +284,7 @@ pub(super) fn want_bound(this: *mut c_void) {
 
 /// A put-off dispatch that could not be recorded.
 pub(super) fn dispatch_dropped() {
-    count(DISPATCHES_SKIPPED);
+    skip(DISPATCHES_SKIPPED, Cause::Dropped);
 }
 
 /// `to` goes on in the arena `from` took its pieces from (`from` takes no more).
@@ -673,7 +788,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
                 }
             }
             Err(e) => {
-                count(DRAWS_SKIPPED);
+                skip(DRAWS_SKIPPED, Cause::DrawError);
                 static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 if N.fetch_add(1, Ordering::Relaxed) < 8 {
                     crate::xlog_warn!("D3D12.X: two-pass DispatchMesh skipped: {e}");
@@ -683,7 +798,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
         return;
     }
     if was_pending || super::pso_async::is_pending(raw_pso) {
-        count(DRAWS_SKIPPED);
+        skip(DRAWS_SKIPPED, Cause::Building);
         return;
     }
     let rs = with(this, |s| s.rs_gfx) as *mut c_void;
@@ -715,8 +830,12 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
     let raw_pso = with(this, |s| s.pso);
     let unbuilt_compute = signature_dispatches(sig) && super::pso_async::is_pending(raw_pso) && super::real::is_console_compute(raw_pso);
-    if unbuilt_compute && super::list_x::defer(this, super::list_x::Deferred::Indirect(sig, max, args, args_off, count_buf, count_off)) {
-        return super::pso_async::need_by_submit(raw_pso);
+    let mut refused = None;
+    if unbuilt_compute {
+        match super::list_x::defer(this, super::list_x::Deferred::Indirect(sig, max, args, args_off, count_buf, count_off)) {
+            Ok(()) => return super::pso_async::need_by_submit(raw_pso),
+            Err(why) => refused = Some(why),
+        }
     }
     // (read first: a build that ends after the stand-in was returned must not send it to the PC)
     let was_pending = super::pso_async::is_pending(raw_pso);
@@ -771,7 +890,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                     }
                 }
                 Err(e) => {
-                    count(DRAWS_SKIPPED);
+                    skip(DRAWS_SKIPPED, Cause::DrawError);
                     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                     if N.fetch_add(1, Ordering::Relaxed) < 8 {
                         crate::xlog_warn!("D3D12.X: two-pass ExecuteIndirect skipped: {e}");
@@ -789,7 +908,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // doesn't match the currently set Pipeline State Object"; a retail title's world then
         // hung the GPU, 0x887a0006). Skipped, like a draw or dispatch of such a pipeline.
         if was_pending || super::pso_async::is_pending(raw_pso) {
-            count(DRAWS_SKIPPED);
+            skip(DRAWS_SKIPPED, refused.unwrap_or(Cause::Building));
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: ExecuteIndirect with a pipeline that is still being built skipped");
@@ -801,7 +920,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // with the title's graphics root signature (e.g. a non-DispatchMesh indirect draw or a
         // root-changing signature) invalidates the command list (Close → E_INVALIDARG).
         if let Some(tp) = super::real::two_pass_of(pso) {
-            count(DRAWS_SKIPPED);
+            skip(DRAWS_SKIPPED, Cause::TwoPass);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!(
@@ -818,7 +937,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // (`CONSOLE_COMPUTE` holds the title's object, which for a shared stand-in differs from
         // the driver pipeline `resolve_wait` returned.)
         if signature_dispatches(sig) && (super::real::is_console_compute(raw_pso) || super::real::is_console_compute(pso)) {
-            count(DISPATCHES_SKIPPED);
+            skip(DISPATCHES_SKIPPED, unbuilt_cause(raw_pso, refused));
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: ExecuteIndirect dispatch with a pipeline that has no translated console shader ({raw_pso:#x}) skipped");
@@ -863,7 +982,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                     Ok(None) => {}
                     Err(e) => {
                         crate::xlog_warn!("D3D12.X: ExecuteIndirect whole compute PSO: {e}");
-                        count(DISPATCHES_SKIPPED);
+                        skip(DISPATCHES_SKIPPED, Cause::DispatchError);
                         return;
                     }
                 }
@@ -872,7 +991,11 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off))
         }
         Err(e) => {
-            count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
+            if gfx {
+                skip(DRAWS_SKIPPED, Cause::DrawError);
+            } else {
+                skip(DISPATCHES_SKIPPED, Cause::DispatchError);
+            }
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: ExecuteIndirect with a translated pipeline skipped: {e}");
@@ -1107,7 +1230,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
         // DrawInstanced / DrawIndexedInstanced against a mesh PSO invalidates the command list
         // (Close → E_INVALIDARG).
         if let Some(tp) = super::real::two_pass_of(real) {
-            count(DRAWS_SKIPPED);
+            skip(DRAWS_SKIPPED, Cause::TwoPass);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!(
@@ -1137,6 +1260,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
         // the title's root signature, which nothing else binds on the PC list – a draw without
         // one is invalid (the debug layer reports it on every GPU; WARP faults on it)
         if super::pso_async::is_pending(pso) {
+            STANDIN_DRAWS.fetch_add(1, Ordering::Relaxed);
             super::list_x::note_dropped_draw(this);
         }
         let rs = with(this, |s| s.rs_gfx) as *mut c_void;
@@ -1155,7 +1279,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
         }
         Err(e) => {
             super::list_x::note_dropped_draw(this);
-            count(DRAWS_SKIPPED);
+            skip(DRAWS_SKIPPED, Cause::DrawError);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: draw with a translated pipeline skipped: {e}");
@@ -1427,11 +1551,15 @@ pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: 
 
 /// #14 Dispatch: with a translated pipeline, on XCL's ABI with the kept root arguments
 pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
-    let pso = with(this, |s| s.pso);
-    if super::pso_async::is_pending(pso) && super::list_x::defer(this, super::list_x::Deferred::Dispatch(x, y, z)) {
-        return super::pso_async::need_by_submit(pso);
+    let raw_pso = with(this, |s| s.pso);
+    let mut refused = None;
+    if super::pso_async::is_pending(raw_pso) {
+        match super::list_x::defer(this, super::list_x::Deferred::Dispatch(x, y, z)) {
+            Ok(()) => return super::pso_async::need_by_submit(raw_pso),
+            Err(why) => refused = Some(why),
+        }
     }
-    let pso = super::pso_async::resolve_wait(pso);
+    let pso = super::pso_async::resolve_wait(raw_pso);
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     if !super::real::is_translated_compute(pso) {
         // a console pipeline without a translation (including a background build that
@@ -1440,13 +1568,13 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
         if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
             crate::xlog_warn!("D3D12.X: Dispatch with a pipeline that has no translated console shader ({pso:#x}) skipped");
         }
-        count(DISPATCHES_SKIPPED);
+        skip(DISPATCHES_SKIPPED, unbuilt_cause(raw_pso, refused));
         return;
     }
     match translated_dispatch(this, list, pso, x, y, z) {
         Ok(()) => count(DISPATCHES),
         Err(e) => {
-            count(DISPATCHES_SKIPPED);
+            skip(DISPATCHES_SKIPPED, Cause::DispatchError);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: Dispatch with a translated pipeline skipped: {e}");
@@ -1623,6 +1751,27 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
 #[cfg(test)]
 pub(super) fn last_draw_args() -> (bool, u32, u32, u32, i32) {
     DRAW_ARGS.with(|d| d.get())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// what this thread counted (tests run in parallel and the statics are shared)
+    static LOCAL: std::cell::RefCell<([u64; 5], [u64; 13])> = const { std::cell::RefCell::new(([0; 5], [0; 13])) };
+}
+
+/// This thread's count of skips under `cause`.
+#[cfg(test)]
+pub(super) fn cause_count(cause: Cause) -> u64 {
+    LOCAL.with(|l| l.borrow().1[cause as usize])
+}
+
+/// This thread's skipped draws and dispatches (the two totals) and the sum of its causes.
+#[cfg(test)]
+pub(super) fn local_skips() -> (u64, u64) {
+    LOCAL.with(|l| {
+        let l = l.borrow();
+        (l.0[DRAWS_SKIPPED] + l.0[DISPATCHES_SKIPPED], l.1.iter().sum())
+    })
 }
 
 #[cfg(test)]
@@ -2235,6 +2384,124 @@ void main(uint t : SV_GroupIndex) {
         real::forget_pso_for_test(real_ok);
     }
 
+    /// Runs `f`, which must skip exactly one call, counted under `cause` and nothing else:
+    /// the causes this thread counted add up to the totals it counted (the statics are shared
+    /// with tests running in parallel, so each thread keeps its own as well).
+    fn expect_skip(cause: Cause, f: impl FnOnce()) {
+        let (total, causes) = local_skips();
+        let before = cause_count(cause);
+        f();
+        let (total_after, causes_after) = local_skips();
+        assert_eq!(cause_count(cause), before + 1, "{cause:?}");
+        assert_eq!(total_after - total, 1, "one skip in the totals");
+        assert_eq!(causes_after - causes, 1, "and in the causes, only under {cause:?}");
+    }
+
+    #[test]
+    fn skipped_calls_are_counted_by_cause() {
+        let mut orig_vt = [0usize; 64];
+        orig_vt[1] = fake_add_ref as usize;
+        orig_vt[2] = fake_release as usize;
+        orig_vt[14] = fake_dispatch as usize;
+        orig_vt[25] = fake_set_pso as usize;
+        orig_vt[29] = fake_set_compute_rs as usize;
+        orig_vt[41] = fake_set_compute_uav as usize;
+        orig_vt[59] = fake_execute_indirect as usize;
+        let mut ext_vt = vec![0usize; 65];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+        let fake = Box::new(FakeAdoptedList {
+            // SAFETY: `ext_vt` has 65 elements so `.add(1)` points to slot 0 with `orig_vt` at `-1`.
+            vt: unsafe { ext_vt.as_ptr().add(1) },
+            refs: AtomicUsize::new(1),
+            dispatch_calls: AtomicUsize::new(0),
+            set_compute_rs_calls: AtomicUsize::new(0),
+            set_compute_uav_calls: AtomicUsize::new(0),
+            set_pso_calls: AtomicUsize::new(0),
+            execute_indirect_calls: AtomicUsize::new(0),
+        });
+        let list = &*fake as *const FakeAdoptedList as *mut c_void;
+        let sig_dispatch = 0x7270_00F8usize;
+        note_signature_dispatches(sig_dispatch, true);
+
+        // the build failed before the call
+        let failed = 0x7270_0001usize;
+        pso_async::submit(failed, true, Box::new(|| 0));
+        assert_eq!(pso_async::resolve_wait(failed), failed);
+        reset(list, 0x7270_0100, failed);
+        expect_skip(Cause::BuildFailed, || unsafe { dispatch(list, 1, 1, 1) });
+
+        // still building, not put off (the list has no wrapper), and not waited for: a Dispatch,
+        // then an ExecuteIndirect dispatch (which counts as a draw skip)
+        let building = 0x7270_0002usize;
+        static BUILD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        pso_async::submit(
+            building,
+            true,
+            Box::new(|| {
+                let t = std::time::Instant::now();
+                while !BUILD.load(Ordering::Acquire) && t.elapsed() < std::time::Duration::from_secs(10) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                0
+            }),
+        );
+        pso_async::image_only(building);
+        real::register_console_compute_for_test(building);
+        reset(list, 0x7270_0100, building);
+        expect_skip(Cause::BuildingNoWrapper, || unsafe { dispatch(list, 1, 1, 1) });
+        expect_skip(Cause::BuildingNoWrapper, || unsafe { execute_indirect(list, sig_dispatch, 1, 0, 0, 0, 0) });
+        BUILD.store(true, Ordering::Release);
+        assert!(pso_async::resolve_wait(building) == building, "the build failed");
+
+        // the default: the call waits for the build, which then fails. The refusal is what is
+        // reported, not the build failure the wait ended with
+        let waited = 0x7270_0004usize;
+        pso_async::submit(
+            waited,
+            true,
+            Box::new(|| {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                0
+            }),
+        );
+        real::register_console_compute_for_test(waited);
+        reset(list, 0x7270_0100, waited);
+        expect_skip(Cause::BuildingNoWrapper, || unsafe { dispatch(list, 1, 1, 1) });
+        assert_eq!(pso_async::build_state(waited), pso_async::BuildState::Failed);
+
+        // a console compute pipeline nothing builds: no translation; put off to a submit and
+        // released by then: released
+        let gone = 0x7270_0003usize;
+        real::register_console_compute_for_test(gone);
+        reset(list, 0x7270_0100, gone);
+        expect_skip(Cause::NoTranslation, || unsafe { dispatch(list, 1, 1, 1) });
+        expect_skip(Cause::Released, || at_submit(|| unsafe { dispatch(list, 1, 1, 1) }));
+        assert!(!AT_SUBMIT.get());
+        let _ = std::panic::catch_unwind(|| at_submit(|| panic!("a panic in a put-off call")));
+        assert!(!AT_SUBMIT.get(), "a panic does not leave the thread marked");
+
+        // a put-off dispatch that could not be recorded
+        expect_skip(Cause::Dropped, dispatch_dropped);
+
+        forget(list);
+        note_signature_dispatches(sig_dispatch, false);
+        for p in [failed, building, waited, gone] {
+            let _ = pso_async::released(p);
+            real::forget_pso_for_test(p);
+        }
+    }
+
+    #[test]
+    fn the_log_line_names_only_the_causes_that_happened() {
+        let mut c = vec![0u64; CAUSE_NAMES.len()];
+        assert_eq!(causes_line(&c), "");
+        c[Cause::BuildFailed as usize] = 3;
+        c[Cause::Dropped as usize] = 1;
+        assert_eq!(causes_line(&c), "; skipped by cause: build failed 3, dropped at submit 1");
+        assert_eq!(CAUSE_NAMES[Cause::DispatchError as usize], "dispatch not bound");
+    }
+
     #[test]
     fn a_command_signature_made_at_a_freed_ones_address_does_not_keep_its_kind() {
         let sig = 0x7230_00F0usize;
@@ -2317,7 +2584,8 @@ void main(uint t : SV_GroupIndex) {
 
         // 1. Direct draw (`graphics_bound`) must return None without binding the title's RS.
         let before = counts_snapshot();
-        let bound = unsafe { graphics_bound(list_ptr) };
+        let mut bound = None;
+        expect_skip(Cause::TwoPass, || bound = unsafe { graphics_bound(list_ptr) });
         let after = counts_snapshot();
         assert!(bound.is_none(), "two-pass MS/GS PSO must not fall through to PC DrawInstanced");
         assert!(after[DRAWS_SKIPPED] > before[DRAWS_SKIPPED]);
@@ -2326,9 +2594,7 @@ void main(uint t : SV_GroupIndex) {
 
         // 2. Unmatched `ExecuteIndirect` must skip without binding the title's RS or calling PC ExecuteIndirect.
         let before = counts_snapshot();
-        unsafe {
-            execute_indirect(list_ptr, 0x7250_00F0, 1, 0, 0, 0, 0);
-        }
+        expect_skip(Cause::TwoPass, || unsafe { execute_indirect(list_ptr, 0x7250_00F0, 1, 0, 0, 0, 0) });
         let after = counts_snapshot();
         assert!(after[DRAWS_SKIPPED] > before[DRAWS_SKIPPED]);
         assert_eq!(fake.set_graphics_rs_calls.load(Ordering::Relaxed), 0);

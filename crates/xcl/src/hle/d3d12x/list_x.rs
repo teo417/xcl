@@ -2722,16 +2722,33 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
 }
 
 /// Gives a dispatch whose pipeline is still being built a segment of its own, recorded at the submit.
-pub(super) unsafe fn defer(list: *mut c_void, what: Deferred) -> bool {
+/// Err: why it could not be put off (the call is then recorded here and waits for its pipeline).
+pub(super) unsafe fn defer(list: *mut c_void, what: Deferred) -> Result<(), super::bind::Cause> {
     if split(list, Some(what)).is_none() {
-        return false;
+        return Err(refusal(list));
     }
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed) + 1;
     if n <= 4 || n.is_power_of_two() {
         crate::xlog_info!("D3D12.X: dispatch with a pipeline still being built put off to the submit (#{n})");
     }
-    true
+    Ok(())
+}
+
+/// Why `split` with a dispatch just said no, from the checks it makes first (in its order).
+unsafe fn refusal(list: *mut c_void) -> super::bind::Cause {
+    use super::bind::Cause;
+    let Some(wrapper) = super::title_list::wrapper_of(list) else { return Cause::BuildingNoWrapper };
+    if !super::title_list::can_split(wrapper, 2) {
+        return Cause::BuildingNoSegments;
+    }
+    if list_type(list) == D3D12_COMMAND_LIST_TYPE_BUNDLE {
+        return Cause::BuildingBundle;
+    }
+    if LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).is_some_and(|s| s.predication.is_some()) {
+        return Cause::BuildingPredicated;
+    }
+    Cause::BuildingPutOffFailed
 }
 
 /// Builds of a submit's put-off calls that go on without the commit headroom, as a title thread's own do: about what the title's threads had in the driver at once before.
@@ -2779,10 +2796,10 @@ pub(super) unsafe fn record_deferred(wrapper: *mut c_void) {
             super::bind::pass_arena(last, seg);
             real::dispatch_chain::list_follows(last as usize, seg as usize);
         }
-        match what {
+        super::bind::at_submit(|| match what {
             Deferred::Dispatch(x, y, z) => super::bind::dispatch(seg, x, y, z),
             Deferred::Indirect(sig, max, args, args_off, count_buf, count_off) => super::bind::execute_indirect(seg, sig, max, args, args_off, count_buf, count_off),
-        }
+        });
         let ext = *(seg as *const usize);
         pc::<unsafe extern "system" fn(*mut c_void) -> i32>(seg, PC_CLOSE)(seg);
         real::preserve_vtable(seg, ext);
@@ -7377,7 +7394,7 @@ mod tests {
             assert_eq!(close_fn(wrap), 0);
             assert!(pso_async::is_pending(standin), "Close waited for the build");
 
-            let skipped = bind::counts_snapshot()[4];
+            let (skipped, failed) = (bind::counts_snapshot()[4], bind::cause_count(bind::Cause::BuildFailed));
             let build = std::thread::spawn(|| {
                 std::thread::sleep(Duration::from_millis(300));
                 BUILD.store(true, Ordering::Release);
@@ -7385,6 +7402,7 @@ mod tests {
             record_deferred(wrap);
             assert!(!pso_async::is_pending(standin), "the submit waits for the build");
             assert!(bind::counts_snapshot()[4] > skipped, "the dispatch of a build that failed is skipped, at the submit");
+            assert!(bind::cause_count(bind::Cause::BuildFailed) > failed, "and counted as a failed build");
             build.join().unwrap();
 
             type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
@@ -7396,6 +7414,70 @@ mod tests {
             let rel_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(2));
             assert_eq!(rel_fn(wrap), 0);
             let _ = pso_async::released(standin);
+        }
+    }
+
+    #[test]
+    fn a_dispatch_that_cannot_be_put_off_is_counted_by_why() {
+        use super::super::{bind, pso_async, title_list};
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let warp = CreateDXGIFactory1::<IDXGIFactory4>().and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>());
+                if warp.and_then(|w| D3D12CreateDevice(&w, D3D_FEATURE_LEVEL_11_0, &mut dev)).is_err() {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                }
+            }
+            let dev = dev.unwrap();
+            // (a pipeline still being built, that no bind waits for: `image_only`)
+            static BUILD: AtomicBool = AtomicBool::new(false);
+            let mut standins = Vec::new();
+            for (n, ty, predicated, cause) in [
+                (1usize, D3D12_COMMAND_LIST_TYPE_BUNDLE, false, bind::Cause::BuildingBundle),
+                (2, D3D12_COMMAND_LIST_TYPE_COMPUTE, true, bind::Cause::BuildingPredicated),
+            ] {
+                let standin = 0x7E57_D100usize + n;
+                standins.push(standin);
+                pso_async::submit(
+                    standin,
+                    true,
+                    Box::new(|| {
+                        let t = std::time::Instant::now();
+                        while !BUILD.load(Ordering::Acquire) && t.elapsed() < std::time::Duration::from_secs(10) {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        0
+                    }),
+                );
+                pso_async::image_only(standin);
+                let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+                let raw: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, None).unwrap();
+                let pc0 = raw.into_raw();
+                real::adopt(pc0, real::Kind::CommandList);
+                on_create(pc0, alloc.as_raw() as usize, 0, ty);
+                bind::reset(pc0, alloc.as_raw() as usize, standin);
+                let wrap = title_list::wrap(pc0);
+                if predicated {
+                    LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(pc0 as usize).or_default().predication = Some(D3D12_PREDICATION_OP_EQUAL_ZERO);
+                }
+
+                let before = (bind::cause_count(cause), bind::local_skips());
+                bind::dispatch(pc0, 1, 1, 1);
+                let after = (bind::cause_count(cause), bind::local_skips());
+                assert_eq!(after.0, before.0 + 1, "{cause:?}");
+                assert_eq!((after.1 .0 - before.1 .0, after.1 .1 - before.1 .1), (1, 1), "one skip, under {cause:?} only");
+
+                let rel_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(2));
+                rel_fn(wrap);
+            }
+            BUILD.store(true, Ordering::Release);
+            for standin in standins {
+                let _ = pso_async::released(standin);
+            }
         }
     }
 

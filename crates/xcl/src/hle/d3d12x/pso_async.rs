@@ -1347,6 +1347,29 @@ pub fn is_pending(pso: usize) -> bool {
     entry(pso).is_some_and(|p| !*p.done.lock().unwrap())
 }
 
+/// How far the background build of stand-in `pso` has got.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuildState {
+    /// no stand-in of this address (never one, or released)
+    Untracked,
+    Building,
+    /// the build is done and made no pipeline
+    Failed,
+    Built,
+}
+
+/// The state of the build behind `pso` (a stand-in the title released is `Untracked`).
+pub fn build_state(pso: usize) -> BuildState {
+    let Some(p) = entry(pso) else { return BuildState::Untracked };
+    if !*p.done.lock().unwrap() {
+        BuildState::Building
+    } else if p.real.load(Ordering::Acquire) == 0 {
+        BuildState::Failed
+    } else {
+        BuildState::Built
+    }
+}
+
 /// One of the title's threads is about to wait for `pso`.
 pub fn want(pso: usize) {
     if let Some(p) = entry(pso) {

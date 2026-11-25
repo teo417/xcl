@@ -329,11 +329,24 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
     // read zeros, in the sparse windows video memory would have doubled them). The window is as
     // large as what the title asked for last time (`uma::coherent_hint`).
     if addr.is_null() && t & 0x1000 != 0 && p & PAGE_GRAPHICS_ANY != 0 && size <= crate::gpu::uma::MAX_SIZE && std::env::var("XCL_COHERENT_HEAPS").map_or(true, |v| v != "0") {
+        let align = if t & 0x2000_0000 != 0 && t & 0x0040_0000 == 0 { 2 << 20 } else { crate::gpu::uma::GRAIN };
+        // `XCL_COHERENT_HEAPS=sparse[:N]`: heaps of at least N MB (all with no N) go to the
+        // sparse windows instead – video memory, the CPU's writes uploaded before each
+        // submission (`d3d12x::sparse`). In the coherent window the GPU reads them over the bus,
+        // uncached, and on NVIDIA its writes that do not fill whole lines run at ~0.1 GB/s
+        // (#505). Costs a second copy in video memory and the write-watch scan of it.
+        if sparse_heaps_min().is_some_and(|min| size >= min) {
+            let rounded = size.max(1).div_ceil(align) * align;
+            if let Some((q, _)) = crate::hle::d3d12x::sparse::alloc(rounded, align) {
+                crate::xlog_info!("kernelx: a GPU heap of {} MB in the sparse windows (XCL_COHERENT_HEAPS)", size >> 20);
+                trace_mem("VirtualAlloc (graphics heap, sparse VRAM)", 0, rounded, t as u64, p, q);
+                return q as *mut c_void;
+            }
+        }
         static ASKED: AtomicUsize = AtomicUsize::new(0);
         let asked = ASKED.fetch_add(size, Ordering::Relaxed) + size;
         crate::gpu::uma::note_coherent_need(asked);
         if let Some(u) = uma {
-            let align = if t & 0x2000_0000 != 0 && t & 0x0040_0000 == 0 { 2 << 20 } else { crate::gpu::uma::GRAIN };
             // what XCL keeps of the window for itself (readback heaps; its per-draw arguments have
             // a pool of their own)
             const KEEP: usize = 96 << 20;
@@ -361,6 +374,21 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
     let q = mem::VirtualAlloc(addr, size, sanitize_alloc_type(t), sanitize_protect(p));
     trace_mem("VirtualAlloc", addr as usize, size, t as u64, p, q as usize);
     q
+}
+
+/// `XCL_COHERENT_HEAPS=sparse` (every GPU heap) or `sparse:N` (heaps of at least N MB): the
+/// smallest heap the sparse windows take instead of the coherent window. Read once.
+fn sparse_heaps_min() -> Option<usize> {
+    static MIN: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| std::env::var("XCL_COHERENT_HEAPS").ok().and_then(|v| parse_sparse_heaps(&v)))
+}
+
+/// `sparse` -> 0, `sparse:N` -> N MB in bytes; anything else -> None
+fn parse_sparse_heaps(v: &str) -> Option<usize> {
+    match v.trim().strip_prefix("sparse")? {
+        "" => Some(0),
+        rest => rest.strip_prefix(':')?.trim().parse::<usize>().ok().and_then(|mb| mb.checked_mul(1 << 20)),
+    }
 }
 
 /// Whether a VirtualAlloc that reached the plain-memory fallback is GPU-visible title memory
@@ -2086,6 +2114,20 @@ pub unsafe extern "system" fn DisableThreadLibraryCalls(h: usize) -> BOOL {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `XCL_COHERENT_HEAPS=sparse[:N]`: which heaps go to the sparse windows
+    #[test]
+    fn sparse_heaps_setting() {
+        assert_eq!(parse_sparse_heaps("sparse"), Some(0), "every heap");
+        assert_eq!(parse_sparse_heaps("sparse:1024"), Some(1024 << 20));
+        assert_eq!(parse_sparse_heaps(" sparse: 512 "), Some(512 << 20));
+        assert_eq!(parse_sparse_heaps("0"), None, "heaps off the coherent window altogether: not this");
+        assert_eq!(parse_sparse_heaps("1"), None);
+        assert_eq!(parse_sparse_heaps("sparse:"), None);
+        assert_eq!(parse_sparse_heaps("sparse:big"), None);
+        assert_eq!(parse_sparse_heaps("sparsex"), None);
+        assert_eq!(parse_sparse_heaps(&format!("sparse:{}", usize::MAX)), None, "no overflow");
+    }
 
     fn real_sleep(ms: u32) {
         std::thread::sleep(std::time::Duration::from_millis(ms as u64));

@@ -38,6 +38,8 @@ const IID_GRAPHICS_COMMAND_LIST: GUID = GUID::from_u128(0x5b160d0f_ac1b_4185_8ba
 const IID_PIPELINE_STATE: GUID = GUID::from_u128(0x765a30f3_f624_4c6f_a828_ace948622445);
 /// D3D12_INDIRECT_ARGUMENT_TYPE of the console's DispatchX
 const XBOX_ARG_DISPATCH_X: u32 = 105;
+/// D3D12_INDIRECT_ARGUMENT_TYPE of the console's DispatchMesh
+const XBOX_ARG_DISPATCH_MESH_X: u32 = 107;
 
 fn guid_bytes(g: &GUID) -> (u32, u16, u16, [u8; 8]) {
     (g.data1, g.data2, g.data3, g.data4)
@@ -1350,8 +1352,18 @@ pub(super) unsafe extern "system" fn get_copyable_footprints_x(
     }
 }
 
-/// device #41 CreateCommandSignature(desc, root signature, riid, signature): the console's
-/// DispatchX argument (105) is a PC Dispatch; the root signature only goes with arguments
+/// Map console indirect argument types (DispatchX 105, DispatchMeshX 107) to PC values;
+/// unrecognized by PC debug layer otherwise.
+fn pc_argument_type(t: u32) -> u32 {
+    match t {
+        XBOX_ARG_DISPATCH_X => D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32,
+        XBOX_ARG_DISPATCH_MESH_X => D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH.0 as u32,
+        _ => t,
+    }
+}
+
+/// device #41 CreateCommandSignature(desc, root signature, riid, signature): console argument
+/// types become PC ones (`pc_argument_type`); the root signature only goes with arguments
 /// that need one (constants, CBV / SRV / UAV)
 pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_void, desc: *const u8, root: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     if desc.is_null() || ppv.is_null() {
@@ -1363,13 +1375,19 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
     let args = u64::from_le_bytes(pc[8..16].try_into().unwrap()) as *const [u32; 4];
     let mut list: Vec<[u32; 4]> = if args.is_null() || n > 64 { Vec::new() } else { (0..n).map(|i| args.add(i).read_unaligned()).collect() };
     for a in list.iter_mut() {
-        if a[0] == XBOX_ARG_DISPATCH_X {
-            a[0] = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32;
-        }
+        a[0] = pc_argument_type(a[0]);
     }
     let needs_root = list.iter().any(|a| (5..=8).contains(&a[0]));
     pc[8..16].copy_from_slice(&(if list.is_empty() { 0 } else { list.as_ptr() as u64 }).to_le_bytes());
     let hr = real::dev_create_command_signature(this, pc.as_ptr() as usize, if needs_root { root } else { 0 }, riid, ppv);
+    if hr < 0 {
+        crate::xlog_warn!(
+            "D3D12.X: CreateCommandSignature stride {} node mask {:#x} root {root:#x} arguments {:?} → {hr:#x}",
+            u32::from_le_bytes(pc[0..4].try_into().unwrap()),
+            u32::from_le_bytes(pc[16..20].try_into().unwrap()),
+            list
+        );
+    }
     if hr >= 0 && !ppv.is_null() && needs_root {
         super::bind::note_root_changing_signature(*ppv as usize);
     }
@@ -1382,6 +1400,15 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn console_indirect_argument_types_become_pc_ones() {
+        assert_eq!(pc_argument_type(105), D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32);
+        assert_eq!(pc_argument_type(107), D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH.0 as u32);
+        for t in 0..=10 {
+            assert_eq!(pc_argument_type(t), t, "PC type {t} stays");
+        }
+    }
 
     #[test]
     fn console_types_and_descs_become_pc_ones() {

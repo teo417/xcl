@@ -482,7 +482,7 @@ mod tests {
             let rs = pso::dispatch_chain_root_signature(&dev, &[]).unwrap();
             let first: ID3D12PipelineState = dev.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC { pRootSignature: std::mem::transmute_copy(&rs),
                 CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr().cast(), BytecodeLength: dxil.len() }, ..Default::default() }).unwrap();
-            let builder = Arc::new(PipelineBuilder { device: dev.clone(), create: never, signature: rs, flags: D3D12_PIPELINE_STATE_FLAG_NONE, node: 0, record: 0 });
+            let builder = Arc::new(PipelineBuilder { device: dev.clone(), create: never, signature: rs.clone(), flags: D3D12_PIPELINE_STATE_FLAG_NONE, node: 0, record: 0 });
             let pso = first.as_raw() as usize;
             CHAINS.lock().unwrap().insert(pso, Arc::new(Chain { builder, tail: vec![first.clone()], words: 4, whole_code: Vec::new(), whole: OnceLock::new(),
                 build_whole: Mutex::new(()), signature: OnceLock::new(), slabs: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() }));
@@ -501,8 +501,13 @@ mod tests {
             // reset, and the read-back does not take the rounds that were not recorded
             // under the title's predication the slicer may not run, so its words are not read back
             // (reported by @thehollowedone, #2404); without it they are
+            // (`bind` sets the chain's root signature, as `bind_abi` does)
             for predicated in [true, false] {
-                assert_eq!(execute_indirect(&list, pso, allocator, args.GetGPUVirtualAddress(), 12, 1, None, &[[1, 1, 1]], predicated, || Ok(())), Ok(true));
+                let bind = || {
+                    list.SetComputeRootSignature(&rs);
+                    Ok(())
+                };
+                assert_eq!(execute_indirect(&list, pso, allocator, args.GetGPUVirtualAddress(), 12, 1, None, &[[1, 1, 1]], predicated, bind), Ok(true));
             }
             let kept = RECORDINGS.lock().unwrap().get(&allocator).map(|v| v.iter().filter_map(|r| r.indirect.as_ref().map(|i| i.checked)).collect::<Vec<_>>());
             assert_eq!(kept, Some(vec![false, false, true]));

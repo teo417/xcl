@@ -1043,6 +1043,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (99, l::set_clear_batch_hint_x as usize),
                 (124, l::rs_set_shading_rate_x as usize),
                 (125, l::rs_set_shading_rate_image_x as usize),
+                (127, b::dispatch_mesh as usize),
                 // Flush{Gpu,Shader}CacheRangeX are called before device #133 sets QUEUE_SHIFTED
                 (131, l::flush_cache_range_x as usize),
                 (132, l::flush_cache_range_x as usize),
@@ -7136,6 +7137,19 @@ const NEWER_LIST_SLOTS: [(usize, usize); 28] = [
     (91, 89), (92, 90), (95, 93), (96, 94), (101, 99), (126, 124), (127, 125), (129, 127),
     (142, 140), (139, 10),
 ];
+
+/// The device that owns `list` (COM `GetDevice` at slot 7).
+pub(super) unsafe fn list_device(list: *mut c_void) -> Option<ID3D12Device> {
+    type F = unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT;
+    let f: F = std::mem::transmute(orig_fn(list, 7));
+    let iid = pc_iid(Kind::Device);
+    let mut raw: *mut c_void = std::ptr::null_mut();
+    if f(list, &iid, &mut raw) >= 0 && !raw.is_null() {
+        Some(ID3D12Device::from_raw(raw))
+    } else {
+        None
+    }
+}
 
 /// The title called device method `slot`, which only runtimes with the newer layouts have (a retail game
 /// records its first lists before any queue call could tell).

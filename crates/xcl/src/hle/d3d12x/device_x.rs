@@ -1362,6 +1362,19 @@ fn pc_argument_type(t: u32) -> u32 {
     }
 }
 
+fn indirect_arg_bytes(arg: &[u32; 4]) -> u32 {
+    match arg[0] {
+        0 => 16,
+        1 => 20,
+        2 | 10 => 12,
+        3 | 4 => 16,
+        5 => arg[3].saturating_mul(4),
+        6..=8 => 8,
+        9 => 108,
+        _ => 0,
+    }
+}
+
 /// device #41 CreateCommandSignature(desc, root signature, riid, signature): console argument
 /// types become PC ones (`pc_argument_type`); the root signature only goes with arguments
 /// that need one (constants, CBV / SRV / UAV)
@@ -1389,8 +1402,26 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
         );
     }
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
-        super::bind::note_root_changing_signature(*ppv as usize, needs_root);
-        super::bind::note_signature_dispatches(*ppv as usize, list.iter().any(|a| a[0] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32));
+        let sig = *ppv as usize;
+        super::bind::note_root_changing_signature(sig, needs_root);
+        let mut dm_sig = None;
+        if !needs_root {
+            if let Some(idx) = list.iter().position(|a| a[0] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH.0 as u32) {
+                let offset: u32 = list[..idx].iter().map(indirect_arg_bytes).sum();
+                let byte_stride = u32::from_le_bytes(pc[0..4].try_into().unwrap());
+                let mut dispatch_list = list.clone();
+                dispatch_list[idx][0] = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32;
+                let mut dpc = pc;
+                dpc[8..16].copy_from_slice(&(dispatch_list.as_ptr() as u64).to_le_bytes());
+                let mut companion: *mut c_void = std::ptr::null_mut();
+                let hr2 = real::dev_create_command_signature(this, dpc.as_ptr() as usize, 0, riid, &mut companion);
+                if hr2 >= 0 && !companion.is_null() {
+                    dm_sig = Some((companion as usize, byte_stride, offset));
+                }
+            }
+        }
+        super::bind::note_dispatch_mesh_signature(sig, dm_sig);
+        super::bind::note_signature_dispatches(sig, list.iter().any(|a| a[0] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32));
     }
     hr
 }

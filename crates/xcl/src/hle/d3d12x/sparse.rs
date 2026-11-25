@@ -31,6 +31,8 @@ use windows_sys::Win32::System::Memory::{
     PAGE_NOACCESS, PAGE_READWRITE,
 };
 
+pub mod gpu_view;
+
 const TILE: usize = 0x1_0000;
 /// tiles of a video-memory pool heap (64 MiB)
 const POOL_TILES: u32 = 1024;
@@ -1433,6 +1435,15 @@ impl State {
     /// Asynchronously copy `runs` (address, bytes) from the CPU view into sparse VRAM tiles via
     /// the 64 MiB ring staging buffer (zero CPU stall on the common path).
     unsafe fn upload_dirty(&mut self, runs: &[(usize, usize)]) {
+        self.upload_runs(runs, &|at, p, n| {
+            std::ptr::copy_nonoverlapping(at as *const u8, p, n);
+            true
+        });
+    }
+
+    /// Copies `runs` (address in a window, bytes) into video memory; `read(address, to, bytes)`
+    /// gives their bytes (false: the run's piece is left as it is).
+    unsafe fn upload_runs(&mut self, runs: &[(usize, usize)], read: &dyn Fn(usize, *mut u8, usize) -> bool) {
         if runs.is_empty() {
             return;
         }
@@ -1479,7 +1490,10 @@ impl State {
                     }
                 };
                 let dst_off = (aligned as usize) % STAGING;
-                std::ptr::copy_nonoverlapping(cur as *const u8, p.add(dst_off), chunk);
+                if !read(cur, p.add(dst_off), chunk) {
+                    done += chunk;
+                    continue;
+                }
                 let staging_res = &self.staging.as_ref().unwrap().0;
                 self.slots[slot_idx].list.CopyBufferRegion(&self.windows[wi].1, (cur - b) as u64, staging_res, dst_off as u64, chunk as u64);
                 self.ring_write = aligned + chunk as u64;
@@ -2099,6 +2113,9 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     }
     if !dirty_runs.is_empty() {
         s.upload_dirty(&dirty_runs);
+    }
+    if gpu_view::on() {
+        gpu_view::sync(s, dirty);
     }
     PHASES[2].fetch_add(t_scanned.elapsed().as_micros() as u64, Ordering::Relaxed);
     {

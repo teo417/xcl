@@ -388,7 +388,20 @@ pub(super) unsafe extern "system" fn set_graphics_root_constants(this: *mut c_vo
 /// #40 / #42)
 pub(super) unsafe extern "system" fn set_graphics_root_descriptor(this: *mut c_void, i: u32, va: u64) {
     note_address(va);
+    let va = readable_root(va);
     put_in(this, true, i, 0, &va.to_le_bytes());
+}
+
+/// The address a root descriptor at `va` gets (`sparse::gpu_view`): a root descriptor has no
+/// size, so as much of the tile is taken as lies in the view. A read through it is in step with
+/// the title's memory, a write is not (a root UAV in a GPU view stays what it was before).
+fn readable_root(va: u64) -> u64 {
+    for len in [0x1_0000usize, 0x1000] {
+        if let Some(b) = super::sparse::gpu_view::base_for(va as usize, len) {
+            return b as u64;
+        }
+    }
+    va
 }
 
 /// `XCL_TRACE_ADDRESSES=1`: root descriptor addresses of console code – in unified memory
@@ -1616,6 +1629,7 @@ pub(super) unsafe extern "system" fn set_compute_root_constants(this: *mut c_voi
 /// #39 / #41): the 64-bit GPU address
 pub(super) unsafe extern "system" fn set_compute_root_descriptor(this: *mut c_void, i: u32, va: u64) {
     note_address(va);
+    let va = readable_root(va);
     put(this, i, 0, &va.to_le_bytes());
 }
 

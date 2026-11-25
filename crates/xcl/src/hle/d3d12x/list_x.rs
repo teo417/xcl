@@ -1559,13 +1559,11 @@ fn wait_expired(aw: &mut ArmedGpuWait, held: bool) -> bool {
 fn wake_sync_watchdog() {
     let pair = sync_watchdog_pair(&SYNC_WATCHDOG_WAKE, || {
         let _ = std::thread::Builder::new().name("xcl-sync-watchdog".into()).spawn(|| loop {
-            let (lock, cv) = SYNC_WATCHDOG_WAKE.get().unwrap();
-            let guard = lock.lock().unwrap();
-            if ARMED_GPU_WAITS.load(Ordering::Acquire) == 0 {
-                let _g = cv.wait(guard).unwrap();
+            let pair = SYNC_WATCHDOG_WAKE.get().unwrap();
+            let Some(guard) = sync_watchdog_sleep_if_idle(pair, &ARMED_GPU_WAITS, || {}) else {
                 continue;
-            }
-            let _ = cv.wait_timeout(guard, Duration::from_millis(50)).unwrap();
+            };
+            let _ = pair.1.wait_timeout(guard, Duration::from_millis(50)).unwrap();
             let (expired, rewinds) = {
                 let mut g = SYNC_GRAPH.lock().unwrap();
                 let mut out: Vec<(u64, u64, ID3D12Fence, usize, i32, Option<usize>, Option<i32>, u64, u64, u64)> = Vec::new();
@@ -1654,6 +1652,27 @@ fn wake_sync_watchdog() {
             }
         });
     });
+    notify_sync_watchdog(pair);
+}
+
+fn sync_watchdog_sleep_if_idle<'a>(
+    pair: &'a (Mutex<()>, Condvar),
+    armed: &AtomicUsize,
+    after_check: impl FnOnce(),
+) -> Option<std::sync::MutexGuard<'a, ()>> {
+    let guard = pair.0.lock().unwrap();
+    if armed.load(Ordering::Acquire) != 0 {
+        return Some(guard);
+    }
+    after_check();
+    let _g = pair.1.wait(guard).unwrap();
+    None
+}
+
+/// Take the pair's lock around `notify_one` so a wake cannot fall between the watchdog's
+/// `armed == 0` check and `Condvar::wait`.
+fn notify_sync_watchdog(pair: &(Mutex<()>, Condvar)) {
+    let _g = pair.0.lock().unwrap();
     pair.1.notify_one();
 }
 
@@ -6577,6 +6596,36 @@ mod tests {
         tf.waits.push((2, 0xC0F0, 6));
         tf.waits.push((3, 0xC0F0, 7));
         assert_eq!(title_fence_uncovered_waiters(&tf, 2), vec![(0xC0F0, 6)]);
+    }
+
+    #[test]
+    fn a_wait_armed_during_the_watchdogs_check_wakes_it() {
+        use std::sync::{mpsc, Arc};
+        let pair = Arc::new((Mutex::new(()), Condvar::new()));
+        let armed = Arc::new(AtomicUsize::new(0));
+        let (checked_tx, checked_rx) = mpsc::channel();
+        let (notified_tx, notified_rx) = mpsc::channel::<()>();
+        let (woke_tx, woke_rx) = mpsc::channel();
+        let (p, a) = (pair.clone(), armed.clone());
+        let watchdog = std::thread::spawn(move || {
+            let slept = sync_watchdog_sleep_if_idle(&p, &a, || {
+                checked_tx.send(()).unwrap();
+                let _ = notified_rx.recv_timeout(Duration::from_millis(200));
+            })
+            .is_none();
+            woke_tx.send(slept).unwrap();
+        });
+        checked_rx.recv().unwrap();
+        armed.fetch_add(1, Ordering::AcqRel);
+        notify_sync_watchdog(&pair);
+        let _ = notified_tx.send(());
+        let woke = woke_rx.recv_timeout(Duration::from_secs(2));
+        if woke.is_err() {
+            pair.1.notify_one();
+        }
+        watchdog.join().unwrap();
+        assert_eq!(woke, Ok(true), "watchdog slept through the arm's notify");
+        assert!(sync_watchdog_sleep_if_idle(&pair, &armed, || unreachable!()).is_some());
     }
 
     /// A CPU cycle-break (`SignalAction::CpuCycleBreak` and `break_cycles_before_title_signal`)

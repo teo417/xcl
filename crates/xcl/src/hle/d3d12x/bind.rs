@@ -238,11 +238,21 @@ fn note_address(va: u64) {
     }
 }
 
-/// command signatures that change root arguments (they need the title's root signature)
+fn set_signature_flag(slot: &Mutex<Option<std::collections::HashSet<usize>>>, sig: usize, active: bool) {
+    let mut s = slot.lock().unwrap();
+    let s = s.get_or_insert_with(Default::default);
+    if active {
+        s.insert(sig);
+    } else {
+        s.remove(&sig);
+    }
+}
+
+/// command signatures that change root arguments (noted at every creation so reused addresses reset)
 static ROOT_SIGNATURES: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
 
-pub(super) fn note_root_changing_signature(sig: usize) {
-    ROOT_SIGNATURES.lock().unwrap().get_or_insert_with(Default::default).insert(sig);
+pub(super) fn note_root_changing_signature(sig: usize, changes: bool) {
+    set_signature_flag(&ROOT_SIGNATURES, sig, changes);
 }
 
 /// command signatures with a Dispatch argument (noted at every creation, so a signature made
@@ -250,13 +260,7 @@ pub(super) fn note_root_changing_signature(sig: usize) {
 static DISPATCH_SIGNATURES: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
 
 pub(super) fn note_signature_dispatches(sig: usize, dispatches: bool) {
-    let mut s = DISPATCH_SIGNATURES.lock().unwrap();
-    let s = s.get_or_insert_with(Default::default);
-    if dispatches {
-        s.insert(sig);
-    } else {
-        s.remove(&sig);
-    }
+    set_signature_flag(&DISPATCH_SIGNATURES, sig, dispatches);
 }
 
 fn signature_dispatches(sig: usize) -> bool {
@@ -1437,7 +1441,7 @@ void main(uint t : SV_GroupIndex) {
         let standin_ok = 0x7200_0001usize;
         let real_ok = 0x7200_0002usize;
         let sig_root_changing = 0x7200_00F0usize;
-        note_root_changing_signature(sig_root_changing);
+        note_root_changing_signature(sig_root_changing, true);
 
         pso_async::submit(
             standin_ok,
@@ -1571,7 +1575,7 @@ void main(uint t : SV_GroupIndex) {
         let sig_dispatch = 0x7210_00F8usize;
         let sig_root_changing = 0x7210_00F0usize;
         note_signature_dispatches(sig_dispatch, true);
-        note_root_changing_signature(sig_root_changing);
+        note_root_changing_signature(sig_root_changing, true);
 
         pso_async::submit_lazy(shell_fail, true, Box::new(|| 0), 0);
         pso_async::shared(shell_fail, shared_driver);
@@ -1637,6 +1641,16 @@ void main(uint t : SV_GroupIndex) {
         let _ = pso_async::released(shell_ok);
         real::forget_pso_for_test(shell_ok);
         real::forget_pso_for_test(real_ok);
+    }
+
+    #[test]
+    fn a_command_signature_made_at_a_freed_ones_address_does_not_keep_its_kind() {
+        let sig = 0x7230_00F0usize;
+        let changing = |s: usize| ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|set| set.contains(&s));
+        note_root_changing_signature(sig, true);
+        assert!(changing(sig));
+        note_root_changing_signature(sig, false);
+        assert!(!changing(sig));
     }
 
     #[test]

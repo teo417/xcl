@@ -213,6 +213,8 @@ fn translate_on_this_thread(
     let res = lw.res;
     let io = lw.init.io.expect("the I/O buffer");
     let mut split_tid = None;
+    // a compute program: whether this group runs (`compute_init`: not past a folded dispatch's count)
+    let mut group_runs = None;
     let numthreads = match &entry {
         Entry::Kernel => {
             lw.setup_lanes();
@@ -226,7 +228,7 @@ fn translate_on_this_thread(
         Entry::Compute(cs) => {
             let (tid, gtid) = lw.setup_lanes_compute(cs.threads, uses_lds);
             if split && !uses_lds && cs.threads == [64, 1, 1] { split_tid = Some(tid); }
-            compute_init(&mut lw, cs, tid, gtid);
+            group_runs = Some(compute_init(&mut lw, cs, tid, gtid));
             cs.threads
         }
         Entry::Mesh(ms) => {
@@ -322,6 +324,8 @@ fn translate_on_this_thread(
     }
     let h0 = if plan.is_some() { lw.block(None) } else { head(&mut lw, entry) };
     let exit = lw.block(None);
+    // where `Block(0)` goes
+    let mut first = h0;
     if gs_only {
         // the GS alone: in the lower hardware wave only
         let gate = lw.block(Some(1));
@@ -329,6 +333,14 @@ fn translate_on_this_thread(
         lw.s.m.set_block(gate);
         let up = lw.upper;
         lw.cond_br(up, exit, h0);
+    } else if let Some(runs) = group_runs {
+        // a folded dispatch's groups past the console's count leave at once (the whole group:
+        // no barrier waits on them)
+        let gate = lw.block(Some(1));
+        lw.edge(Block(0), gate);
+        lw.s.m.set_block(gate);
+        lw.cond_br(runs, h0, exit);
+        first = gate;
     } else {
         lw.edge(Block(0), h0);
     }
@@ -441,7 +453,7 @@ fn translate_on_this_thread(
     }
     lw.s.m.ret();
     lw.s.m.set_block(Block(0));
-    lw.s.m.br(h0);
+    lw.s.m.br(first);
     let hw = if split || !o.wave64 { 32 } else { 64 };
     let limit = if compute && (!split || split_tid.is_some()) { dispatch_piece_limit() } else { 0 };
     lw.finish_dispatch(numthreads, hw, limit, split_tid)
@@ -718,12 +730,28 @@ fn store_registers(lw: &mut Lw, res: super::shader::RawUav) {
 
 /// The compute entry's fixed registers (the HLSL compute mode's prologue): group ids
 /// after the user SGPRs, TG_SIZE, SCC = 0, EXEC = the wave's threads, v0..v2 = thread id.
-pub fn compute_init(lw: &mut Lw, cs: &CsInterface, tid: Value, gtid: [Value; 3]) {
+/// Returns whether this group runs: a dispatch folded into Y (`recomp::IO_GROUP_LIMIT` in `io`
+/// not 0, the console's group count in X) takes its group in X from both ids, and the groups
+/// past that count do not run.
+pub fn compute_init(lw: &mut Lw, cs: &CsInterface, tid: Value, gtid: [Value; 3]) -> Value {
+    let io = lw.init.io.expect("the I/O buffer");
+    let o = lw.c((crate::gpu::recomp::IO_GROUP_LIMIT * 4) as u32);
+    let limit = lw.s.raw_load(io, o, 1)[0];
+    let (gx, gy) = (lw.s.group_id(0), lw.s.group_id(1));
+    let k = lw.c(crate::gpu::recomp::FOLD_X);
+    let rows = lw.mul(gy, k);
+    let flat = lw.add(gx, rows);
+    let folded = lw.cmpc(Pred::Ne, limit, 0);
+    let zero = lw.c(0);
+    let ids = [lw.sel(folded, flat, gx), lw.sel(folded, zero, gy)];
+    let inside = lw.cmp(Pred::ULt, flat, limit);
+    let t = lw.b(true);
+    let runs = lw.sel(folded, inside, t);
     let mut sgpr = HashMap::new();
     let mut next = cs.user_sgprs;
     for k in 0..3 {
         if cs.tgid[k] {
-            let g = lw.s.group_id(k as u32);
+            let g = if k < 2 { ids[k] } else { lw.s.group_id(2) };
             sgpr.insert(next, g);
             next += 1;
         }
@@ -751,6 +779,7 @@ pub fn compute_init(lw: &mut Lw, cs: &CsInterface, tid: Value, gtid: [Value; 3])
         }
     }
     lw.init.compute = Some(ComputeInit { sgpr, vgpr, zero });
+    runs
 }
 
 /// The mesh entry's registers (the HLSL mesh mode's prologue): SGPRs from `io` with the

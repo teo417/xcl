@@ -1304,12 +1304,15 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
             prev = c;
         }
     }
-    // compute: every lane that runs is in EXEC, and nothing is stored at the end – the skip and
-    // store blocks are left unreachable (a bare `ret`)
+    // compute: every lane that runs is in EXEC, and nothing is stored at the end – the store
+    // blocks are left unreachable, and the skip block (a bare `ret`) takes the groups past a
+    // folded dispatch's count
     if kernel {
         preds[skip] = vec![0];
         preds[sstore] = vec![exit];
         preds[vstore] = vec![exit, sstore];
+    } else if matches!(stage, Stage::Compute(_)) {
+        preds[skip] = vec![0];
     }
     preds[exit] = kernel.then_some(skip).into_iter().chain(ends.iter().map(|&b| tail[b])).collect();
     for i in 0..count {
@@ -1402,11 +1405,25 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
         }
         Stage::Compute(cs) => {
             let (flat, tid) = l.ir.compute_ids(cs.threads);
+            // a dispatch folded into Y (`IO_GROUP_LIMIT` not 0: the console's group count in X):
+            // the group in X from both ids, the groups past the count leave at once
+            let a = l.ir.int(super::IO_GROUP_LIMIT as u32);
+            let limit = l.ir.io_load(a);
+            let (gx, gy) = (l.ir.group_id(0), l.ir.group_id(1));
+            let k = l.ir.int(super::FOLD_X);
+            let rows = l.ir.bin(Bin::Mul, gy, k);
+            let group = l.ir.bin(Bin::Add, gx, rows);
+            let z = l.ir.int(0);
+            let folded = l.ir.icmp(Cmp::Ne, limit, z);
+            let ids = [l.ir.select(folded, group, gx), l.ir.select(folded, z, gy)];
+            let inside = l.ir.icmp(Cmp::Ult, group, limit);
+            let t = l.ir.boolean(true);
+            let runs = l.ir.select(folded, inside, t);
             // system SGPRs after the user data: the enabled group ids, then TG_SIZE
             let mut next = cs.user_sgprs as u8;
             for k in 0..3 {
                 if cs.tgid[k as usize] {
-                    let g = l.ir.group_id(k);
+                    let g = if k < 2 { ids[k as usize] } else { l.ir.group_id(k) };
                     l.write_num(0, next, g);
                     next += 1;
                 }
@@ -1436,7 +1453,7 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
             // every lane that runs is in EXEC
             let t = l.ir.boolean(true);
             l.write_bit(0, EXEC, t);
-            l.ir.br(blk(0));
+            l.ir.br_if(runs, blk(0), skip);
             l.ir.at(skip);
             l.ssa.seal(&mut l.ir, skip);
             l.ir.ret();

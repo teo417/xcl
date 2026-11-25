@@ -7526,6 +7526,8 @@ fn gpu_compute_tg_size_counts_a_partial_last_wave() {
 /// A dispatch of more groups in X than D3D12 takes, folded into Y (`IO_GROUP_LIMIT`): each of
 /// the console's groups runs once with its own id in X, none past its count; with no count in io
 /// the groups are the dispatch's own (a retail game's 72 512 × 1 × 1 hung the GPU unfolded).
+/// The HLSL path, then the direct translator (`gpu::dxil`, wave32 / wave64 / split wave64) and
+/// its per-lane form (`lower_dxil`): `bind` and `clamp` fold for every translated pipeline.
 #[test]
 fn gpu_compute_folded_dispatch_runs_each_console_group_once() {
     if !gpu_ready() {
@@ -7539,26 +7541,41 @@ fn gpu_compute_folded_dispatch_runs_each_console_group_once() {
         ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 4), ("SADDR", 0x7D)], None),
     ]);
     let fold = super::FOLD_X;
-    for wave64 in [false, true] {
-        let cs = super::CsInterface { threads: [1, 1, 1], user_sgprs: 2, tgid: [true, false, false], tg_size: false, tid_components: 1 };
-        let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(cs), wave64, ..Default::default() })).unwrap();
-        assert!(t.complete(), "{:?}", t.unsupported_why);
-        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    // each console group once, none past the count; unfolded, the dispatch's own groups
+    let check = |dxil: &[u8], what: &str| {
         for n in [72_512u32, fold + 1] {
             let rows = n.div_ceil(fold);
             let mut io = vec![0u32; 128];
             io[super::IO_GROUP_LIMIT] = n;
-            let mem = runner::dispatch(&dxil, [fold, rows, 1], &io, &vec![0xFFFF_FFFFu32; (fold * rows) as usize]).unwrap();
+            let mem = runner::dispatch(dxil, [fold, rows, 1], &io, &vec![0xFFFF_FFFFu32; (fold * rows) as usize]).unwrap_or_else(|e| panic!("{what}: {e}"));
             for (k, &got) in mem.iter().enumerate() {
                 let want = if (k as u32) < n { k as u32 } else { 0xFFFF_FFFF };
-                assert_eq!(got, want, "wave64 {wave64}: {n} groups folded into {fold} x {rows}, group {k}");
+                assert_eq!(got, want, "{what}: {n} groups folded into {fold} x {rows}, group {k}");
             }
         }
-        // not folded: the dispatch's own groups (Y left alone)
-        let mem = runner::dispatch(&dxil, [100, 1, 1], &[0u32; 128], &vec![0xFFFF_FFFFu32; 128]).unwrap();
+        let mem = runner::dispatch(dxil, [100, 1, 1], &[0u32; 128], &vec![0xFFFF_FFFFu32; 128]).unwrap();
         for (k, &got) in mem.iter().enumerate() {
-            assert_eq!(got, if k < 100 { k as u32 } else { 0xFFFF_FFFF }, "wave64 {wave64}: unfolded group {k}");
+            assert_eq!(got, if k < 100 { k as u32 } else { 0xFFFF_FFFF }, "{what}: unfolded group {k}");
         }
+    };
+    let cs = super::CsInterface { threads: [1, 1, 1], user_sgprs: 2, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+    // the native wave64 forms need a GPU that runs wave64 (the split form runs anywhere)
+    let wave64_ok = runner::wave64_supported() == Ok(true);
+    for wave64 in [false, true] {
+        let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(cs.clone()), wave64, ..Default::default() })).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}
+{}", t.hlsl));
+        check(&dxil, &format!("HLSL, wave64 {wave64}"));
+        if !wave64 || wave64_ok {
+            let dxil = super::lower_dxil::compute_code(&p, &cs, wave64).unwrap();
+            check(&dxil, &format!("per-lane, wave64 {wave64}"));
+        }
+    }
+    for (wave64, split) in [(false, false), (true, false), (true, true)].into_iter().filter(|&(w, s)| !w || s || wave64_ok) {
+        let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 };
+        let k = crate::gpu::dxil::kernel::translate_compute(&p, o, &cs).unwrap();
+        check(&k.dxil, &format!("direct, wave64 {wave64}, split {split}"));
     }
 }
 

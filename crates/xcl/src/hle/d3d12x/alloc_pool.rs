@@ -116,6 +116,28 @@ pub fn reset_list(list: usize, alloc: usize, ty: i32, reset: impl FnOnce(usize) 
     hr
 }
 
+/// The PC allocator `list` records on, also for a list this module has not seen: XCL's own (a
+/// mid-list split's next list, made on `current(alloc)`) records on the PC allocator the title's
+/// `alloc` stands for. Such a list is taken on there, so that its submits mark that allocator and
+/// it stays busy until the list is reset elsewhere or released. Off: `alloc`. 0: none.
+pub(super) fn recording_backing_or_take_on(list: usize, alloc: usize, ty: i32) -> usize {
+    if !enabled() {
+        return alloc;
+    }
+    let mut g = STATE.lock().unwrap();
+    let s = g.get_or_insert_with(State::default);
+    if let Some(&b) = s.of_list.get(&list) {
+        return b;
+    }
+    if alloc == 0 {
+        return 0;
+    }
+    let b = s.cur.get(&alloc).copied().unwrap_or(alloc);
+    s.types.entry(alloc).or_insert(ty);
+    move_list(s, list, b);
+    b
+}
+
 #[cfg(test)]
 pub(super) use recording_backing as recording_backing_for_test;
 
@@ -368,6 +390,38 @@ mod tests {
         assert_eq!(s.aside.get(&alloc), Some(&vec![alloc]), "only the successful reset switches backings");
         assert_eq!(s.of_list.get(&list), Some(&alloc), "the earlier recording stays on its original backing");
         assert_eq!((s.made, s.swaps), (0, 1));
+    }
+
+    /// A list the pool has not seen (XCL's own, made on the PC allocator the title's allocator
+    /// stands for) is taken on there by a chained ExecuteIndirect: that allocator is busy with it.
+    #[test]
+    fn a_list_the_pool_has_not_seen_is_taken_on_with_the_pc_allocator_it_records_on() {
+        let mut ids = Box::new([0u8; 4]);
+        let base = ids.as_mut_ptr() as usize;
+        let (title, backing, list, other) = (base, base + 1, base + 2, base + 3);
+        let ty = D3D12_COMMAND_LIST_TYPE_DIRECT.0;
+        STATE.lock().unwrap().get_or_insert_with(State::default).cur.insert(title, backing);
+        let taken = recording_backing_or_take_on(list, title, ty);
+        let again = recording_backing_or_take_on(list, other, ty);
+        let (busy, typed) = {
+            let g = STATE.lock().unwrap();
+            let s = g.as_ref().unwrap();
+            (s.backings.get(&backing).is_some_and(|b| b.users.contains(&list) && !unsafe { b.free() }), s.types.get(&title) == Some(&ty))
+        };
+        let none = recording_backing_or_take_on(other, 0, ty);
+        forget_list(list);
+        {
+            let mut g = STATE.lock().unwrap();
+            let s = g.as_mut().unwrap();
+            s.cur.remove(&title);
+            s.types.remove(&title);
+            s.backings.remove(&backing);
+        }
+        assert_eq!(taken, backing, "filed with the PC allocator the list records on, not the title's");
+        assert_eq!(again, backing, "a list taken on keeps its backing");
+        assert!(busy, "the backing is busy while the list records on it");
+        assert!(typed, "the title's allocator can be swapped while the list holds its backing");
+        assert_eq!(none, 0);
     }
 
     /// Final-release cleanup drops only the recording's hold: another live list and a pending

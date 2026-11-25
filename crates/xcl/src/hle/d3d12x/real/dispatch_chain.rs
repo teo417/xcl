@@ -444,10 +444,12 @@ pub(in crate::hle::d3d12x) unsafe fn execute_indirect(list: &ID3D12GraphicsComma
     commands: u32, count: Option<u64>, seen: &[[u32; 3]], predicated: bool, bind: impl FnOnce() -> Result<(), String>) -> Result<bool, String> {
     let chain = CHAINS.lock().unwrap().get(&pso).cloned();
     let Some(chain) = chain else { return Ok(false) };
-    let allocator = if super::super::alloc_pool::enabled() {
-        super::super::alloc_pool::recording_backing(list.as_raw() as usize).unwrap_or(0)
-    } else { allocator };
-    if allocator == 0 || list.GetType() == D3D12_COMMAND_LIST_TYPE_BUNDLE { return Ok(false); }
+    if list.GetType() == D3D12_COMMAND_LIST_TYPE_BUNDLE { return Ok(false); }
+    // kept with the PC allocator the list records on, also for a list the pool has not seen (#2333
+    // keeps such a list's with the title's allocator: the pool knew nothing of the list, and could
+    // take that allocator for free while the list still recorded or ran on the GPU)
+    let allocator = super::super::alloc_pool::recording_backing_or_take_on(list.as_raw() as usize, allocator, list.GetType().0);
+    if allocator == 0 { return Ok(false); }
     let dev = &chain.builder.device;
     let group = u64::from(chain.words) * 4;
     let Some((scratch, _)) = scratch_for(dev, list.as_raw() as usize, allocator, scratch_budget(), group) else { return Ok(false) };

@@ -3017,7 +3017,11 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
         Kind::PipelineState => v.push(("Release", pso_release as usize)),
         Kind::DescriptorHeap => v.push(("Release", heap_release as usize)),
         Kind::Heap => v.push(("Release", mem_heap_release as usize)),
-        Kind::Fence => v.push(("Signal", fence_signal as usize)),
+        Kind::Fence => v.extend_from_slice(&[
+            ("Signal", fence_signal as usize),
+            ("GetCompletedValue", fence_get_completed_value as usize),
+            ("SetEventOnCompletion", fence_set_event_on_completion as usize),
+        ]),
         _ => {}
     }
     v
@@ -3294,6 +3298,39 @@ pub(super) unsafe fn create_raw_pc_command_list(
     };
     (hr >= 0 && !out.is_null()).then_some(out)
 }
+/// A command allocator and a closed list of XCL's own, made with the device's own methods past
+/// XCL's hooks, as the objects made before the device is adopted are: neither is adopted, so
+/// none of the list hooks (`cl_close`, `cl_reset`, the copy hooks) run for work XCL submits on
+/// a queue of its own.
+pub(super) unsafe fn create_own_list(dev: &ID3D12Device, ty: D3D12_COMMAND_LIST_TYPE) -> Option<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> {
+    let d = dev.as_raw();
+    if !is_adopted(d) {
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).ok()?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, None).ok()?;
+        list.Close().ok()?;
+        return Some((alloc, list));
+    }
+    let iface = layout::find("ID3D12Device")?;
+    type Alloc = unsafe extern "system" fn(*mut c_void, D3D12_COMMAND_LIST_TYPE, *const GUID, *mut *mut c_void) -> HRESULT;
+    type List = unsafe extern "system" fn(*mut c_void, u32, D3D12_COMMAND_LIST_TYPE, *mut c_void, *mut c_void, *const GUID, *mut *mut c_void) -> HRESULT;
+    let create_alloc: Alloc = std::mem::transmute(orig_fn(d, layout::slot(iface, "CreateCommandAllocator")?));
+    let create_list: List = std::mem::transmute(orig_fn(d, layout::slot(iface, "CreateCommandList")?));
+    let mut a = std::ptr::null_mut();
+    let iid = &ID3D12CommandAllocator::IID as *const windows::core::GUID as *const GUID;
+    if create_alloc(d, ty, iid, &mut a) < 0 || a.is_null() {
+        return None;
+    }
+    let alloc = ID3D12CommandAllocator::from_raw(a);
+    let mut l = std::ptr::null_mut();
+    let iid = &ID3D12GraphicsCommandList::IID as *const windows::core::GUID as *const GUID;
+    if create_list(d, 0, ty, a, std::ptr::null_mut(), iid, &mut l) < 0 || l.is_null() {
+        return None;
+    }
+    let list = ID3D12GraphicsCommandList::from_raw(l);
+    list.Close().ok()?;
+    Some((alloc, list))
+}
+
 creator!(dev_create_descriptor_heap, "CreateDescriptorHeap", Kind::DescriptorHeap, [a1]);
 creator!(dev_create_committed_resource_pc, "CreateCommittedResource", Kind::Resource, [a1, a2, a3, a4, a5]);
 creator!(dev_create_committed_resource1_pc, "CreateCommittedResource1", Kind::Resource, [a1, a2, a3, a4, a5, a6]);
@@ -3729,6 +3766,7 @@ static FENCES: std::sync::RwLock<Vec<usize>> = std::sync::RwLock::new(Vec::new()
 unsafe extern "system" fn dev_create_fence(this: *mut c_void, value: usize, flags: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let hr = dev_create_fence_pc(this, value, flags, riid, ppv);
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        set_fence_landed(*ppv as usize, value as u64);
         let add: RefFn = std::mem::transmute(*vt(*ppv).add(1));
         add(*ppv);
         let n = {
@@ -7468,6 +7506,118 @@ unsafe extern "system" fn q_signal_x(this: *mut c_void, fence: *mut c_void, valu
     hr
 }
 
+/// Per title fence, the highest value it was seen at with the copies back that value covers
+/// landed (seeded with its initial value at CreateFence)
+static FENCE_LANDED: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
+
+/// A fence made (again at this address): its initial value
+fn set_fence_landed(fence: usize, v: u64) {
+    FENCE_LANDED.lock().unwrap().get_or_insert_with(HashMap::new).insert(fence, v);
+}
+
+/// `fence` was seen at `v` with its copies back landed
+fn note_fence_landed(fence: usize, v: u64) {
+    let mut g = FENCE_LANDED.lock().unwrap();
+    let e = g.get_or_insert_with(HashMap::new).entry(fence).or_insert(v);
+    *e = (*e).max(v);
+}
+
+/// What `GetCompletedValue` tells the title: `v` once the copies back it covers landed;
+/// otherwise the fence where it was last seen with them landed (`landed`), and the title looks
+/// again – it is not blocked, so a holder of the sparse state waiting for this thread can go on
+fn completed_for_title(v: u64, settled: bool, landed: Option<u64>) -> u64 {
+    if settled {
+        v
+    } else {
+        landed.map_or(v, |l| l.min(v))
+    }
+}
+
+/// Fence::GetCompletedValue. What the title's lists wrote into its sparse memory comes back
+/// asynchronously (`sparse::readback_after_execute`): the copies back the value covers land
+/// first, and while they cannot (the sparse state is busy) the value does not go past them.
+unsafe extern "system" fn fence_get_completed_value(this: *mut c_void) -> u64 {
+    let f: unsafe extern "system" fn(*mut c_void) -> u64 = std::mem::transmute(orig_fn(this, slot_of(this, "GetCompletedValue")));
+    let v = f(this);
+    if !super::sparse::readbacks_async() {
+        return v;
+    }
+    let settled = super::sparse::settle_readbacks_try();
+    if settled {
+        note_fence_landed(this as usize, v);
+    }
+    let landed = FENCE_LANDED.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).copied());
+    completed_for_title(v, settled, landed)
+}
+
+/// A `fence_set_event_on_completion` wait: the title's event, XCL's own event the fence sets, and
+/// the thread-pool wait on it (0 until registered)
+struct FenceWait {
+    own: *mut c_void,
+    title: *mut c_void,
+    wait: AtomicUsize,
+    /// the fence and the value waited for
+    fence: usize,
+    value: u64,
+}
+
+unsafe extern "system" fn fence_wait_fired(ctx: *mut c_void, _timed_out: bool) {
+    use windows_sys::Win32::System::Threading::{SetEvent, UnregisterWaitEx};
+    let w = ctx as *mut FenceWait;
+    // the title's event only once the copies back the value covers landed (on this pool thread,
+    // which may wait)
+    if super::sparse::settle_readbacks_until_landed(std::time::Duration::from_secs(10)) {
+        note_fence_landed((*w).fence, (*w).value);
+    }
+    SetEvent((*w).title);
+    let mut wh = (*w).wait.load(Ordering::Acquire);
+    while wh == 0 {
+        std::hint::spin_loop();
+        wh = (*w).wait.load(Ordering::Acquire);
+    }
+    // no completion event: the registration goes once this callback returns
+    UnregisterWaitEx(wh as *mut c_void, std::ptr::null_mut());
+    windows_sys::Win32::Foundation::CloseHandle((*w).own);
+    drop(Box::from_raw(w));
+}
+
+/// Fence::SetEventOnCompletion. Once copies back land asynchronously, the title's event is set
+/// after the fence is reached and the copies back it covers landed: the fence sets an event of
+/// XCL's own, and a thread-pool wait on that settles them and sets the title's. A null event
+/// (a blocking wait) settles them after it.
+unsafe extern "system" fn fence_set_event_on_completion(this: *mut c_void, value: u64, event: *mut c_void) -> HRESULT {
+    use windows_sys::Win32::System::Threading::{CreateEventW, RegisterWaitForSingleObject, UnregisterWaitEx, INFINITE, WT_EXECUTELONGFUNCTION, WT_EXECUTEONLYONCE};
+    let f: unsafe extern "system" fn(*mut c_void, u64, *mut c_void) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "SetEventOnCompletion")));
+    if event.is_null() || !super::sparse::readbacks_async() {
+        let hr = f(this, value, event);
+        if event.is_null() && hr >= 0 && super::sparse::settle_readbacks_until_landed(std::time::Duration::from_secs(10)) {
+            note_fence_landed(this as usize, value);
+        }
+        return hr;
+    }
+    let own = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+    if own.is_null() {
+        return f(this, value, event);
+    }
+    let w = Box::into_raw(Box::new(FenceWait { own, title: event, wait: AtomicUsize::new(0), fence: this as usize, value }));
+    let mut wh = std::ptr::null_mut();
+    if RegisterWaitForSingleObject(&mut wh, own, Some(fence_wait_fired), w as *const c_void, INFINITE, WT_EXECUTEONLYONCE | WT_EXECUTELONGFUNCTION) == 0 {
+        windows_sys::Win32::Foundation::CloseHandle(own);
+        drop(Box::from_raw(w));
+        return f(this, value, event);
+    }
+    (*w).wait.store(wh as usize, Ordering::Release);
+    let hr = f(this, value, own);
+    if hr < 0 {
+        // the event will not be set: take the wait back (waiting for a running callback)
+        if UnregisterWaitEx(wh, windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE) != 0 {
+            windows_sys::Win32::Foundation::CloseHandle(own);
+            drop(Box::from_raw(w));
+        }
+    }
+    hr
+}
+
 /// Fence::Signal (CPU)
 unsafe extern "system" fn fence_signal(this: *mut c_void, value: u64) -> HRESULT {
     let f: unsafe extern "system" fn(*mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "Signal")));
@@ -8454,6 +8604,16 @@ mod console_format_query_tests {
 #[cfg(test)]
 mod map_tests {
     use super::*;
+
+    /// GetCompletedValue gives the title the fence's value once its copies back landed, and
+    /// otherwise no more than where it was last seen with them landed.
+    #[test]
+    fn a_fence_value_goes_past_its_landed_copies_only_once_they_land() {
+        assert_eq!(completed_for_title(9, true, Some(4)), 9);
+        assert_eq!(completed_for_title(9, false, Some(4)), 4);
+        assert_eq!(completed_for_title(3, false, Some(4)), 3, "never above the fence itself");
+        assert_eq!(completed_for_title(9, false, None), 9, "a fence XCL did not see made");
+    }
 
     /// A title's Map reaches the PC's only for a resource the PC can map: a buffer in an upload,
     /// readback or CPU-visible custom heap. One in a DEFAULT heap, a custom heap without CPU pages

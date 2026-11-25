@@ -571,6 +571,24 @@ pub(super) unsafe fn note_render_targets(this: *mut c_void, n: u32, rtvs: *const
     with_bindings(this, |b| b.render_targets = Some(RenderTargets { num_targets, handles, single, dsv: d }));
 }
 
+/// The render target views bound on `list` (each one of a single descriptor range too).
+pub(super) unsafe fn bound_render_targets(list: *mut c_void) -> Vec<usize> {
+    static INC: AtomicU32 = AtomicU32::new(0);
+    let Some(rt) = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).and_then(|s| s.bindings.render_targets.clone()) else {
+        return Vec::new();
+    };
+    if rt.single == 0 || rt.num_targets <= 1 {
+        return rt.handles;
+    }
+    let Some(&base) = rt.handles.first() else { return Vec::new() };
+    let mut inc = INC.load(Ordering::Relaxed) as usize;
+    if inc == 0 {
+        inc = device_of(list).map_or(0, |d| d.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV) as usize);
+        INC.store(inc as u32, Ordering::Relaxed);
+    }
+    (0..rt.num_targets as usize).map(|i| base + i * inc).collect()
+}
+
 /// Set again what `b` holds (after KickoffX's Reset or a deferred mid-list split).
 unsafe fn restore_bindings(this: *mut c_void, b: &Bindings, ty: D3D12_COMMAND_LIST_TYPE) {
     if ty == D3D12_COMMAND_LIST_TYPE_COPY {

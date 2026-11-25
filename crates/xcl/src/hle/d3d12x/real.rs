@@ -2276,6 +2276,11 @@ unsafe extern "system" fn dev_create_dsv_x(this: *mut c_void, res: *mut c_void, 
     if copy.is_none() {
         copy = ID3D12Resource::from_raw_borrowed(&res).and_then(|r| default_dsv(&r.GetDesc()));
     }
+    // `XCL_DUMP_TARGETS`: the depth buffer a DSV names, kept with the RTVs' resources (DSV
+    // and RTV handles are in different heaps)
+    if super::targets::enabled() {
+        super::present::note_rtv(cpu as usize, res);
+    }
     f(this, res, copy.as_ref().map_or(desc, |c| c as *const _), cpu)
 }
 

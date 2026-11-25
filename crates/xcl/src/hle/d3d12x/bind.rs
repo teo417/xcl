@@ -915,6 +915,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // doesn't match the currently set Pipeline State Object"; a retail title's world then
         // hung the GPU, 0x887a0006). Skipped, like a draw or dispatch of such a pipeline.
         if was_pending || super::pso_async::is_pending(raw_pso) {
+            ei_work(this, sig, super::targets::STANDIN);
             skip(DRAWS_SKIPPED, refused.unwrap_or(Cause::Building));
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -944,6 +945,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // (`CONSOLE_COMPUTE` holds the title's object, which for a shared stand-in differs from
         // the driver pipeline `resolve_wait` returned.)
         if signature_dispatches(sig) && (super::real::is_console_compute(raw_pso) || super::real::is_console_compute(pso)) {
+            super::targets::note_dispatch();
             skip(DISPATCHES_SKIPPED, unbuilt_cause(raw_pso, refused));
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -956,11 +958,13 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         if let (Some(list), Some(r)) = (ID3D12GraphicsCommandList::from_raw_borrowed(&this), ID3D12RootSignature::from_raw_borrowed(&rs)) {
             list.SetGraphicsRootSignature(r);
         }
+        ei_work(this, sig, super::targets::PC);
         let cat = if signature_dispatches(sig) { super::gpu_timing::Cat::IndirectDispatch } else { super::gpu_timing::Cat::IndirectDraw };
         let _cat = super::gpu_timing::CatScope::begin_raw(this, cat);
         return fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
     }
     if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
+        ei_work(this, sig, super::targets::SKIPPED);
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
             crate::xlog_warn!("D3D12.X: ExecuteIndirect that changes root arguments with a translated pipeline skipped");
@@ -1000,6 +1004,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                     }
                 }
             }
+            ei_work(this, sig, super::targets::RAN);
             count(if gfx { DRAWS } else { DISPATCHES });
             let cat = if gfx { super::gpu_timing::Cat::IndirectDraw } else { super::gpu_timing::Cat::IndirectDispatch };
             let _cat = super::gpu_timing::CatScope::begin(list, cat);
@@ -1024,6 +1029,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             }
         }
         Err(e) => {
+            ei_work(this, sig, super::targets::SKIPPED);
             if gfx {
                 skip(DRAWS_SKIPPED, Cause::DrawError);
             } else {
@@ -1077,6 +1083,18 @@ unsafe fn indirect_address(res: usize, title: u64, pc: u64) -> Option<u64> {
     match super::real::console_buffer(res) {
         Some((p, _)) => super::real::uma_va_of(p + title as usize),
         None => Some(ID3D12Resource::from_raw_borrowed(&(res as *mut c_void))?.GetGPUVirtualAddress()).filter(|&va| va != 0).map(|va| va + pc),
+    }
+}
+
+/// `XCL_DUMP_TARGETS`: an ExecuteIndirect with `outcome` (a dispatch signature's: a dispatch)
+unsafe fn ei_work(this: *mut c_void, sig: usize, outcome: usize) {
+    if !super::targets::enabled() {
+        return;
+    }
+    if signature_dispatches(sig) {
+        super::targets::note_dispatch();
+    } else {
+        super::targets::note_draw(this, outcome);
     }
 }
 
@@ -1282,7 +1300,13 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
                     tp.kind
                 );
             }
+            if super::targets::enabled() {
+                super::targets::note_draw(this, super::targets::SKIPPED);
+            }
             return None;
+        }
+        if super::targets::enabled() {
+            super::targets::note_draw(this, if super::pso_async::is_pending(pso) { super::targets::STANDIN } else { super::targets::PC });
         }
         count(DRAWS_PC);
         if super::present::trace_frame() {
@@ -1318,11 +1342,13 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
     }
     match bind_abi(this, &list, pso, true, 0) {
         Ok(_) => {
+            super::targets::note_draw(this, super::targets::RAN);
             count(DRAWS);
             Some(list)
         }
         Err(e) => {
             super::list_x::note_dropped_draw(this);
+            super::targets::note_draw(this, super::targets::SKIPPED);
             skip(DRAWS_SKIPPED, Cause::DrawError);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
@@ -1603,6 +1629,7 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
             Err(why) => refused = Some(why),
         }
     }
+    super::targets::note_dispatch();
     let pso = super::pso_async::resolve_wait(raw_pso);
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     if !super::real::is_translated_compute(pso) {

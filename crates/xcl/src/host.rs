@@ -51,6 +51,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 [p, e, d, x, f[0], f[1], f[2], f[3], r, b >> 20, fail]
             };
             let mut last = snap();
+            let mut last_skipped = [0u64; 3];
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 let now = snap();
@@ -95,6 +96,14 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     pso[3],
                     pso[4]
                 );
+                let skipped = crate::hle::d3d12x::bind::skipped_activity();
+                crate::xlog_info!(
+                    "skipped (2 s): {} draws, {} draws left to a stand-in, {} dispatches",
+                    skipped[0] - last_skipped[0],
+                    skipped[1] - last_skipped[1],
+                    skipped[2] - last_skipped[2]
+                );
+                last_skipped = skipped;
                 last = now;
             }
         });

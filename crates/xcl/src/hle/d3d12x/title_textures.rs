@@ -1480,9 +1480,13 @@ unsafe fn read_committed_into(at: usize, out: &mut [u8]) {
     // about to the end of its run of like pages, and the title's memory is a few runs of hundreds
     // of MiB – a 16 KiB texture cost ~120 µs at the start of a 64 MiB run, ~1.3 ms of 512 MiB.
     // `ReadProcessMemory` refuses a range with a page that is not committed, no-access or a guard
-    // page (and leaves the guard in place: `title_bytes_leave_guard_pages_alone`).
+    // page (and leaves the guard in place: `title_bytes_leave_guard_pages_alone`). Under Wine
+    // that test fails with it (#2844), so there it is region by region.
     let mut read = 0usize;
-    if len == 0 || ReadProcessMemory(GetCurrentProcess(), at as *const c_void, out.as_mut_ptr() as *mut c_void, len, &mut read) != 0 {
+    if len == 0 {
+        return;
+    }
+    if !crate::util::under_wine() && ReadProcessMemory(GetCurrentProcess(), at as *const c_void, out.as_mut_ptr() as *mut c_void, len, &mut read) != 0 {
         return;
     }
     // with holes: region by region (a refused `ReadProcessMemory` costs more than the walk)

@@ -157,6 +157,11 @@ fn test_title_runs_and_game_folder_is_untouched() {
     assert!(stdout.contains("xcl_testtitle: done, failures: 0"), "the test title did not run to the end");
     assert!(out.status.success(), "exit code {:?}", out.status.code());
 
+    let log = std::fs::read_to_string(data.join("XCL.TestTitle/logs/xcl.log")).unwrap();
+    let backend_init = log.find("D3D12.X: backend '").expect("backend initialized");
+    let dll_init = log.find("DllMain(").expect("dependent DLL initialized");
+    assert!(backend_init < dll_init, "D3D12 backend initialized after title DLL code ran");
+
     // (2) the game folder is untouched
     assert_eq!(snapshot(&game), before, "GAME FOLDER WAS MODIFIED");
 

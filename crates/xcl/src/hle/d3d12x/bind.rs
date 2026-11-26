@@ -868,6 +868,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                     (_, Some(p)) => Some(p),
                     _ => return Err("its count is not in a console buffer in unified memory".into()),
                 };
+                let _cat = super::gpu_timing::CatScope::begin(list, super::gpu_timing::Cat::TwoPass);
                 let (scaled, at) = make_scaled_args_buffer(this, list, src, count, max, msig.byte_stride, msig.mesh_offset, tp.mesh_groups_per_record, cap)?;
                 let passes = (|| -> Result<(), String> {
                     for (k, compute) in two_pass_steps(max) {
@@ -950,6 +951,8 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         if let (Some(list), Some(r)) = (ID3D12GraphicsCommandList::from_raw_borrowed(&this), ID3D12RootSignature::from_raw_borrowed(&rs)) {
             list.SetGraphicsRootSignature(r);
         }
+        let cat = if signature_dispatches(sig) { super::gpu_timing::Cat::IndirectDispatch } else { super::gpu_timing::Cat::IndirectDraw };
+        let _cat = super::gpu_timing::CatScope::begin_raw(this, cat);
         return fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
     }
     if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
@@ -989,6 +992,8 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 }
             }
             count(if gfx { DRAWS } else { DISPATCHES });
+            let cat = if gfx { super::gpu_timing::Cat::IndirectDraw } else { super::gpu_timing::Cat::IndirectDispatch };
+            let _cat = super::gpu_timing::CatScope::begin(list, cat);
             fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off))
         }
         Err(e) => {

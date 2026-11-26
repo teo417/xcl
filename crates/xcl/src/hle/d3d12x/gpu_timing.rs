@@ -2,8 +2,10 @@
 //! are left alone: with them timed too, a title stopped submitting as soon as they started to wait
 //! for its direct queue (RTX 4080 SUPER, two runs of two).
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -11,7 +13,7 @@ use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
 
 const SLOTS: usize = 256;
-const CAT_SLOTS: usize = 8192;
+const CAT_SLOTS: usize = 32768;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cat {
@@ -20,25 +22,39 @@ pub enum Cat {
     Draw = 2,
     Dispatch = 3,
     Copy = 4,
+    IndirectDraw = 5,
+    IndirectDispatch = 6,
+    /// UAV and depth clears, resolves
+    Clear = 7,
 }
+
+/// the names of [`Cat`] in its order
+const CAT_NAMES: [&str; 8] = ["chain", "two_pass", "draw", "dispatch", "copy", "indirect_draw", "indirect_dispatch", "clear"];
+const CATS: usize = CAT_NAMES.len();
 
 static SUBMISSIONS: AtomicU64 = AtomicU64::new(0);
 static LISTS_TIMED: AtomicU64 = AtomicU64::new(0);
 static GPU_TIME_US: AtomicU64 = AtomicU64::new(0);
 static MAX_SUBMIT_US: AtomicU64 = AtomicU64::new(0);
 static UNTIMED: AtomicU64 = AtomicU64::new(0);
-static CAT_US: [AtomicU64; 5] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
-static CAT_COUNT: [AtomicU64; 5] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static CAT_US: [AtomicU64; CATS] = [const { AtomicU64::new(0) }; CATS];
+static CAT_COUNT: [AtomicU64; CATS] = [const { AtomicU64::new(0) }; CATS];
+/// scopes not timed because no query pair was free
+static CAT_DROPPED: AtomicU64 = AtomicU64::new(0);
 
-/// `[(us, count); 5]` for `[Chain, TwoPass, Draw, Dispatch, Copy]`
-pub fn cat_activity() -> [(u64, u64); 5] {
-    [
-        (CAT_US[0].load(Ordering::Relaxed), CAT_COUNT[0].load(Ordering::Relaxed)),
-        (CAT_US[1].load(Ordering::Relaxed), CAT_COUNT[1].load(Ordering::Relaxed)),
-        (CAT_US[2].load(Ordering::Relaxed), CAT_COUNT[2].load(Ordering::Relaxed)),
-        (CAT_US[3].load(Ordering::Relaxed), CAT_COUNT[3].load(Ordering::Relaxed)),
-        (CAT_US[4].load(Ordering::Relaxed), CAT_COUNT[4].load(Ordering::Relaxed)),
-    ]
+thread_local! {
+    /// a scope is open on this thread: what is recorded inside it counts for it alone
+    static CAT_OPEN: Cell<bool> = const { Cell::new(false) };
+}
+
+/// `name=ms (scopes)` per category, and the scopes left untimed
+pub fn cat_line() -> String {
+    let mut out = String::new();
+    for (i, name) in CAT_NAMES.iter().enumerate() {
+        let _ = write!(out, "{name}={} ({}), ", CAT_US[i].load(Ordering::Relaxed) / 1000, CAT_COUNT[i].load(Ordering::Relaxed));
+    }
+    let _ = write!(out, "{} untimed", CAT_DROPPED.load(Ordering::Relaxed));
+    out
 }
 
 pub fn enabled() -> bool {
@@ -150,7 +166,7 @@ impl CatScope {
     }
 
     pub unsafe fn begin(list: &ID3D12GraphicsCommandList, cat: Cat) -> Option<Self> {
-        if !enabled() || list.GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT {
+        if !enabled() || CAT_OPEN.get() || list.GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT {
             return None;
         }
         let mut guard = CAT_POOL.lock().unwrap();
@@ -160,11 +176,15 @@ impl CatScope {
             *guard = CatPool::new(&dev?);
         }
         let pool = guard.as_mut()?;
-        let slot = pool.free.pop()?;
+        let Some(slot) = pool.free.pop() else {
+            CAT_DROPPED.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
         let heap = pool.heap.clone();
         let readback = pool.readback.clone();
         drop(guard);
         list.EndQuery(&heap, D3D12_QUERY_TYPE_TIMESTAMP, (slot * 2) as u32);
+        CAT_OPEN.set(true);
         Some(Self {
             list: list.as_raw() as usize,
             slot,
@@ -177,6 +197,14 @@ impl CatScope {
 
 impl Drop for CatScope {
     fn drop(&mut self) {
+        // (cleared last: the resolve below goes through the list's hooks too)
+        struct Close;
+        impl Drop for Close {
+            fn drop(&mut self) {
+                CAT_OPEN.set(false);
+            }
+        }
+        let _close = Close;
         unsafe {
             let raw = self.list as *mut c_void;
             if let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&raw) {

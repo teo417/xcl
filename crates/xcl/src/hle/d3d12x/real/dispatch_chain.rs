@@ -219,7 +219,8 @@ static LIST_RECORDINGS: LazyLock<Mutex<HashMap<usize, Vec<Arc<Recording>>>>> = L
 /// after another, with a barrier between them (the recordings keep it alive)
 static SHARED: LazyLock<Mutex<HashMap<usize, (usize, std::sync::Weak<Scratch>)>>> = LazyLock::new(Default::default);
 
-/// `list` begins another recording, which the GPU may run beside the last one.
+/// `list` begins another recording, which the GPU may run beside the last one: a Reset, or a
+/// list created at the address of a released one (#2588). Also when it is released.
 pub(in crate::hle::d3d12x) fn list_reset(list: usize) {
     SHARED.lock().unwrap().remove(&list);
     LIST_RECORDINGS.lock().unwrap().remove(&list);
@@ -231,6 +232,16 @@ pub(in crate::hle::d3d12x) fn list_follows(from: usize, to: usize) {
     if let Some(e) = shared.get(&from).cloned() {
         shared.insert(to, e);
     }
+}
+
+#[cfg(test)]
+pub(in crate::hle::d3d12x) fn note_shared_for_test(list: usize, allocator: usize) {
+    SHARED.lock().unwrap().insert(list, (allocator, std::sync::Weak::new()));
+}
+
+#[cfg(test)]
+pub(in crate::hle::d3d12x) fn shares_scratch_for_test(list: usize) -> bool {
+    SHARED.lock().unwrap().contains_key(&list)
 }
 
 /// The scratch of all recordings alive together, `XCL_SPLIT_SCRATCH_TOTAL_MB` (384). A recording

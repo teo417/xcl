@@ -828,6 +828,7 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
     let key = list as usize;
     // (of a list that was here before and whose release was not seen: the GPU may still use it)
     release_copy_scratch(key);
+    real::dispatch_chain::list_reset(key);
     let old = {
         let mut g = LISTS.lock().unwrap();
         let m = g.get_or_insert_with(HashMap::new);
@@ -866,6 +867,7 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
 pub(super) fn on_release(list: usize) {
     super::alloc_pool::forget_list(list);
     release_copy_scratch(list);
+    real::dispatch_chain::list_reset(list);
     super::title_textures::list_reset(list);
     let old = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&list));
     if let Some(old) = old {
@@ -4800,6 +4802,21 @@ pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, hea
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// A list made at the address of a released one does not share the split programs' scratch
+    /// of the old one's recordings, which the GPU may still run (#2588: addresses are reused)
+    #[test]
+    fn a_list_at_a_released_lists_address_starts_without_its_chain_scratch() {
+        let list = 0x7a51_0000usize;
+        real::dispatch_chain::note_shared_for_test(list, 0x333);
+        on_release(list);
+        assert!(!real::dispatch_chain::shares_scratch_for_test(list), "kept after the release");
+        // a release not seen: the create clears it
+        real::dispatch_chain::note_shared_for_test(list, 0x333);
+        unsafe { on_create(list as *mut c_void, 0x333, 0, D3D12_COMMAND_LIST_TYPE_DIRECT) };
+        assert!(!real::dispatch_chain::shares_scratch_for_test(list), "kept by a list created at the address");
+        on_release(list);
+    }
 
     /// An internal wait shows in the watchdog's summary while its fence is short of the value,
     /// and is gone from it once the fence gets there.

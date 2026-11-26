@@ -363,20 +363,33 @@ unsafe fn freeze(a: usize, n: usize) -> bool {
     true
 }
 
-/// `ranges` minus the read-only spans, as pieces within one block each.
-fn hot_pieces(ranges: &[(usize, usize)], cold: &BTreeMap<usize, usize>) -> Vec<(usize, usize)> {
+/// `ranges` minus the read-only spans (`cold`: by start, `end_of` their ends), as pieces within
+/// one block each. The spans are walked once while the ranges ascend, as a look's do: two map
+/// queries per span were 0.2 ms a look with 9,000 spans.
+fn hot_pieces<V>(ranges: &[(usize, usize)], cold: &BTreeMap<usize, V>, end_of: impl Fn(&V) -> usize) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
+    let all = || cold.iter().map(|(&s, v)| (s, end_of(v))).peekable();
+    // `last`: the span with the greatest start up to `seen`; `spans`: the ones after it
+    let (mut spans, mut last, mut seen) = (all(), None::<(usize, usize)>, 0);
     for &(base, size) in ranges {
         let end = base + size;
         let mut at = base;
+        if base < seen {
+            (spans, last) = (all(), None);
+        }
         while at < end {
+            seen = at;
+            while let Some(&span) = spans.peek().filter(|span| span.0 <= at) {
+                last = Some(span);
+                spans.next();
+            }
             let block_end = ((at & !(BLOCK - 1)) + BLOCK).min(end);
             // the read-only span covering `at`, else the next one starting before `block_end`
-            if let Some((_, &e)) = cold.range(..=at).next_back().filter(|(_, &e)| e > at) {
+            if let Some((_, e)) = last.filter(|&(_, e)| e > at) {
                 at = e.min(end);
                 continue;
             }
-            let stop = cold.range(at..block_end).next().map_or(block_end, |(&s, _)| s);
+            let stop = spans.peek().map_or(block_end, |&(s, _)| s.min(block_end));
             out.push((at, stop - at));
             at = stop;
         }
@@ -406,8 +419,7 @@ pub unsafe fn look(ranges: &[(usize, usize)], dirty: &mut Vec<usize>, page: usiz
     for (buf, n) in report {
         dirty.extend((buf & !(page - 1)..buf + n).step_by(page));
     }
-    let cold: BTreeMap<usize, usize> = COLD.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(&s, c)| (s, c.end)).collect();
-    let pieces = hot_pieces(ranges, &cold);
+    let pieces = hot_pieces(ranges, &COLD.lock().unwrap_or_else(|e| e.into_inner()), |c| c.end);
     let watched: usize = ranges.iter().map(|r| r.1).sum();
     let hot: usize = pieces.iter().map(|p| p.1).sum();
     STATS[3].fetch_add((watched - hot) as u64, Ordering::Relaxed);
@@ -490,9 +502,66 @@ mod tests {
         let b = 0x4000_0000usize;
         let ranges = [(b, 3 * BLOCK)];
         let cold = BTreeMap::from([(b + BLOCK, b + 2 * BLOCK)]);
-        assert_eq!(hot_pieces(&ranges, &cold), vec![(b, BLOCK), (b + 2 * BLOCK, BLOCK)]);
+        assert_eq!(hot_pieces(&ranges, &cold, |&e| e), vec![(b, BLOCK), (b + 2 * BLOCK, BLOCK)]);
         let cold = BTreeMap::from([(b + 0x1000, b + 0x3000)]);
-        assert_eq!(hot_pieces(&[(b, 0x5000)], &cold), vec![(b, 0x1000), (b + 0x3000, 0x2000)]);
+        assert_eq!(hot_pieces(&[(b, 0x5000)], &cold, |&e| e), vec![(b, 0x1000), (b + 0x3000, 0x2000)]);
+    }
+
+    /// The one walk over the spans gives the pieces a query per span gave: spans that start
+    /// before a range, end past it, lie between ranges or touch each other, and ranges that
+    /// ascend, overlap or come out of order.
+    #[test]
+    fn hot_pieces_walk_matches_a_query_per_span() {
+        fn by_query(ranges: &[(usize, usize)], cold: &BTreeMap<usize, usize>) -> Vec<(usize, usize)> {
+            let mut out = Vec::new();
+            for &(base, size) in ranges {
+                let end = base + size;
+                let mut at = base;
+                while at < end {
+                    let block_end = ((at & !(BLOCK - 1)) + BLOCK).min(end);
+                    if let Some((_, &e)) = cold.range(..=at).next_back().filter(|(_, &e)| e > at) {
+                        at = e.min(end);
+                        continue;
+                    }
+                    let stop = cold.range(at..block_end).next().map_or(block_end, |(&s, _)| s);
+                    out.push((at, stop - at));
+                    at = stop;
+                }
+            }
+            out
+        }
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move |n: usize| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % n as u64) as usize
+        };
+        let b = 0x4000_0000usize;
+        for round in 0..200 {
+            // disjoint spans of 1..=600 pages, 0..=700 pages apart, from before the ranges on
+            let mut cold = BTreeMap::new();
+            let mut at = b - 0x40_0000;
+            for _ in 0..next(60) {
+                at += next(701) * 0x1000;
+                let end = at + (1 + next(600)) * 0x1000;
+                cold.insert(at, end);
+                at = end;
+            }
+            let mut ranges = Vec::new();
+            let mut at = b;
+            for _ in 0..1 + next(8) {
+                at += next(900) * 0x1000;
+                let size = (1 + next(1500)) * 0x1000;
+                ranges.push((at, size));
+                // every third round the next range starts inside this one
+                at += if round % 3 == 2 { size / 2 } else { size };
+            }
+            if round % 5 == 4 {
+                ranges.reverse();
+            }
+            assert_eq!(hot_pieces(&ranges, &cold, |&e| e), by_query(&ranges, &cold), "round {round}: {ranges:x?} {cold:x?}");
+        }
     }
 
     /// (from the top of the address space: tests that free an address and expect it to stay free

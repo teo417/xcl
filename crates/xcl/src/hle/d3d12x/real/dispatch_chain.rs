@@ -21,6 +21,8 @@ static INDIRECT_WHOLE: AtomicU64 = AtomicU64::new(0);
 static INDIRECT_LOST: AtomicU64 = AtomicU64::new(0);
 /// ExecuteIndirects that ran the whole form (not chainable)
 static WHOLE_INDIRECT: AtomicU64 = AtomicU64::new(0);
+/// recordings made (`RECORDINGS`)
+static RECORDED: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn log_counts() {
     let mib = |a: &AtomicU64| a.load(Ordering::Relaxed) >> 20;
@@ -28,6 +30,16 @@ pub(crate) fn log_counts() {
     crate::xlog_info!("compute split: {} programs split, {} pieces built, {} chained dispatches issued in {} slabs; scratch {} MiB (most {}, largest dispatch {} in one slab); ExecuteIndirect: {} chained ({} of them whole, {} slabs lost), {} whole",
         n(&PROGRAMS), n(&PIECES), n(&DISPATCHES), n(&SLABS), mib(&LIVE), mib(&PEAK), mib(&WANTED),
         n(&INDIRECT), n(&INDIRECT_WHOLE), n(&INDIRECT_LOST), n(&WHOLE_INDIRECT));
+    // what holds the recordings still kept: they go when their PC allocator is reset or, put aside, is free
+    let (keys, held) = {
+        let r = RECORDINGS.lock().unwrap();
+        let keys: Vec<(usize, usize)> = r.iter().map(|(&a, v)| (a, v.len())).collect();
+        let held = keys.iter().map(|&(_, n)| n).sum::<usize>();
+        (keys, held)
+    };
+    let [users, gpu, free, busy, idle, unknown] = super::super::alloc_pool::holds(&keys);
+    crate::xlog_info!("compute split: {held} of {} recordings held, under {} PC allocators: put aside with a list on it {users}, put aside with submits on the GPU {gpu}, put aside and free {free}; in use and busy {busy}, in use and free {idle}; not the pool's {unknown}",
+        n(&RECORDED), keys.len());
 }
 
 /// The scratch a dispatch uses at once, `XCL_SPLIT_SCRATCH_MB` (256): more groups than fit run in
@@ -431,6 +443,7 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
     };
     let first = ID3D12PipelineState::from_raw_borrowed(&(pso as *mut c_void)).ok_or("first compute piece")?.clone();
     let held = Arc::new(Recording { scratch, first, chain, indirect: None });
+    RECORDED.fetch_add(1, Ordering::Relaxed);
     if owned {
         LIST_RECORDINGS.lock().unwrap().entry(list_key).or_default().push(held.clone());
     } else {
@@ -537,6 +550,7 @@ pub(in crate::hle::d3d12x) unsafe fn execute_indirect(list: &ID3D12GraphicsComma
         pso::record_dispatch_chain_indirect(list, &sig, &buffer, rounds, &scratch.buffer, std::iter::once(&first).chain(&chain.tail));
     }
     let indirect = Indirect { commands: buffer, bytes: cmd_bytes, at, rounds, whole: full.is_some(), checked: bound.is_ok() && !predicated };
+    RECORDED.fetch_add(1, Ordering::Relaxed);
     RECORDINGS.lock().unwrap().entry(allocator).or_default().push(Arc::new(Recording { scratch, first, chain, indirect: Some(indirect) }));
     bound?;
     INDIRECT.fetch_add(1, Ordering::Relaxed);

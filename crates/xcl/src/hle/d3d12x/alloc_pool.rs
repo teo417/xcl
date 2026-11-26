@@ -249,6 +249,34 @@ pub(super) unsafe fn allocator_in_flight(alloc: usize) -> bool {
     busy
 }
 
+/// Of chain recordings held under PC allocators (`(allocator, recordings)`), how many are under
+/// one put aside that a list still records on, that the GPU has not finished, that is free; under
+/// one a title's allocator stands for now that is busy, that is free; under one the pool does not
+/// know (the split-program counter line, `dispatch_chain::log_counts`).
+pub(super) fn holds(keys: &[(usize, usize)]) -> [usize; 6] {
+    let mut k = [0; 6];
+    let g = STATE.lock().unwrap();
+    let Some(s) = g.as_ref() else {
+        k[5] = keys.iter().map(|&(_, n)| n).sum();
+        return k;
+    };
+    let aside: HashSet<usize> = s.aside.values().flatten().copied().collect();
+    let in_use: HashSet<usize> = s.cur.values().copied().chain(s.types.keys().filter(|a| !s.cur.contains_key(a)).copied()).collect();
+    for &(b, n) in keys {
+        let backing = s.backings.get(&b);
+        let free = backing.is_none_or(|x| unsafe { x.free() });
+        let i = if aside.contains(&b) {
+            if backing.is_some_and(|x| !x.users.is_empty()) { 0 } else if !free { 1 } else { 2 }
+        } else if in_use.contains(&b) {
+            if free { 4 } else { 3 }
+        } else {
+            5
+        };
+        k[i] += n;
+    }
+    k
+}
+
 /// The title's allocator `alloc` is gone (its last Release): nothing of it stays here – a later
 /// allocator may get its address, and must not go on with this one's PC allocators. The ones
 /// made here go with it (those lists still record on are left alone: not freed, not tracked).
@@ -541,6 +569,35 @@ mod tests {
         assert!(while_recording, "the recording went while the list still recorded on its allocator");
         assert!(while_on_gpu, "the recording went while its submit was on the GPU");
         assert!(!after, "the recording stayed after the list moved on and its submit was done");
+    }
+
+    /// The counter line's split of the chain recordings held: by what holds the PC allocator
+    /// they are under.
+    #[test]
+    fn the_recordings_held_are_split_by_what_holds_their_allocator() {
+        let mut ids = Box::new([0u8; 8]);
+        let base = ids.as_mut_ptr() as usize;
+        let (title, used, free, busy, idle, other, list, list2) = (base, base + 1, base + 2, base + 3, base + 4, base + 5, base + 6, base + 7);
+        {
+            let mut g = STATE.lock().unwrap();
+            let s = g.get_or_insert_with(State::default);
+            s.aside.insert(title, vec![used, free]);
+            s.cur.insert(title, busy);
+            s.types.insert(idle, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+            s.backings.entry(used).or_default().users.insert(list);
+            s.backings.entry(busy).or_default().users.insert(list2);
+        }
+        let k = holds(&[(used, 1), (free, 2), (busy, 3), (idle, 4), (other, 5)]);
+        {
+            let mut g = STATE.lock().unwrap();
+            let s = g.as_mut().unwrap();
+            s.aside.remove(&title);
+            s.cur.remove(&title);
+            s.types.remove(&idle);
+            s.backings.remove(&used);
+            s.backings.remove(&busy);
+        }
+        assert_eq!(k, [1, 0, 2, 3, 4, 5]);
     }
 
     /// The case #2333's lines leave open: a list the pool had not seen, whose title's allocator

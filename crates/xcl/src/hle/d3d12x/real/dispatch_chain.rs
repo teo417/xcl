@@ -64,6 +64,8 @@ struct Chain {
     whole_code: Vec<u8>,
     whole: OnceLock<ID3D12PipelineState>,
     build_whole: Mutex<()>,
+    /// threads other than `want_whole`'s waiting for the whole form
+    waiting: std::sync::atomic::AtomicUsize,
     /// its command signature for ExecuteIndirect (`pso::chain_command_signature`)
     signature: OnceLock<ID3D12CommandSignature>,
     /// the most slabs one of its ExecuteIndirects had, the last one read back, and whether one
@@ -79,6 +81,15 @@ struct Chain {
 impl Chain {
     unsafe fn whole(&self) -> Result<ID3D12PipelineState, String> {
         if let Some(p) = self.whole.get() { return Ok(p.clone()); }
+        // `want_whole`'s build may hold `build_whole` while it waits for its turn
+        // (`big_compile_turn`): while this thread waits, that build is one the title waits for
+        self.waiting.fetch_add(1, Ordering::AcqRel);
+        let built = self.build_whole_form();
+        self.waiting.fetch_sub(1, Ordering::AcqRel);
+        built
+    }
+
+    unsafe fn build_whole_form(&self) -> Result<ID3D12PipelineState, String> {
         let _guard = self.build_whole.lock().unwrap();
         if let Some(p) = self.whole.get() { return Ok(p.clone()); }
         let p = self.builder.pipeline(&self.whole_code, &pc_iid(Kind::PipelineState)).ok_or("whole compute pipeline")?;
@@ -91,7 +102,11 @@ impl Chain {
         if !self.wanted.swap(true, Ordering::Relaxed) {
             let chain = self.clone();
             whole_thread().spawn(move || unsafe {
-                if let Err(e) = chain.whole() { crate::xlog_warn!("D3D12.X: whole form of a split program: {e}"); }
+                let waited = chain.clone();
+                let built = super::super::pso_async::build_waited_on(move || waited.waiting.load(Ordering::Acquire) > 0, || {
+                    if chain.whole.get().is_some() { Ok(()) } else { chain.build_whole_form().map(drop) }
+                });
+                if let Err(e) = built { crate::xlog_warn!("D3D12.X: whole form of a split program: {e}"); }
             }).ok();
         }
     }
@@ -126,7 +141,7 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
     let mut pieces = built.into_iter().collect::<Option<Vec<_>>>()?.into_iter();
     let first = pieces.next()?;
     let chain = Arc::new(Chain { builder, tail: pieces.collect(), words: plan.dwords_per_group,
-        whole_code: whole.to_vec(), whole: OnceLock::new(), build_whole: Mutex::new(()), signature: OnceLock::new(),
+        whole_code: whole.to_vec(), whole: OnceLock::new(), build_whole: Mutex::new(()), waiting: Default::default(), signature: OnceLock::new(),
         slabs: Default::default(), last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() });
     PROGRAMS.fetch_add(1, Ordering::Relaxed);
     PIECES.fetch_add(plan.pieces.len() as u64, Ordering::Relaxed);
@@ -704,7 +719,7 @@ mod tests {
             let builder = Arc::new(PipelineBuilder { device: dev.clone(), create: never, signature: rs.clone(), flags: D3D12_PIPELINE_STATE_FLAG_NONE, node: 0, record: 0 });
             let pso = first.as_raw() as usize;
             CHAINS.lock().unwrap().insert(pso, Arc::new(Chain { builder, tail: vec![first.clone()], words: 4, whole_code: Vec::new(), whole: OnceLock::new(),
-                build_whole: Mutex::new(()), signature: OnceLock::new(), slabs: Default::default(), last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() }));
+                build_whole: Mutex::new(()), waiting: Default::default(), signature: OnceLock::new(), slabs: Default::default(), last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() }));
             let ty = D3D12_COMMAND_LIST_TYPE_COMPUTE;
             let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
             let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, None).unwrap();
@@ -761,5 +776,46 @@ mod tests {
         assert_eq!(super::pooled_size(1), 64 << 10);
         assert_eq!(super::pooled_size(64 << 10), 64 << 10);
         assert_eq!(super::pooled_size((64 << 10) + 1), 128 << 10);
+    }
+
+    /// A title thread that needs the whole form while `want_whole`'s build of it waits for its
+    /// turn (`big_compile_turn`, every background slot taken) does not wait behind that turn: the
+    /// build is then one the title waits for, with the wanted cap and no commit wait (#2404)
+    #[test]
+    fn a_title_thread_does_not_wait_behind_a_background_whole_build_waiting_for_its_turn() {
+        use super::*;
+        use std::time::{Duration, Instant};
+        unsafe extern "system" fn refused(_: *mut c_void, _: *const c_void, _: *const GUID, _: *mut *mut c_void) -> HRESULT { E_INVALIDARG }
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            }
+            let dev = dev.unwrap();
+            let rs = pso::dispatch_chain_root_signature(&dev, &[]).unwrap();
+            let builder = Arc::new(PipelineBuilder { device: dev, create: refused, signature: rs, flags: D3D12_PIPELINE_STATE_FLAG_NONE, node: 0, record: 0 });
+            // a huge whole form no cache has: its build on `want_whole`'s thread is gated
+            let mut code = vec![0u8; huge_pso_bytes()];
+            let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            code[..16].copy_from_slice(&nonce.to_le_bytes());
+            let chain = Arc::new(Chain { builder, tail: Vec::new(), words: 4, whole_code: code, whole: OnceLock::new(),
+                build_whole: Mutex::new(()), waiting: Default::default(), signature: OnceLock::new(), slabs: Default::default(), last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() });
+            let held: Vec<_> = (0..huge_pso_concurrency()).map(|_| big_compile_turn(&BIG_COMPILES, || true, || false)).collect();
+            chain.want_whole();
+            let started = Instant::now();
+            while chain.build_whole.try_lock().is_ok() {
+                assert!(started.elapsed() < Duration::from_secs(10), "the background build did not start");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let (done, waited) = std::sync::mpsc::channel();
+            let title = chain.clone();
+            std::thread::spawn(move || {
+                let _ = title.whole();
+                let _ = done.send(());
+            });
+            let waited = waited.recv_timeout(Duration::from_secs(5));
+            drop(held);
+            assert!(waited.is_ok(), "the title thread waited for the background build's turn");
+        }
     }
 }

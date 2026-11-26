@@ -55,12 +55,25 @@ struct Demand {
 thread_local! {
     /// what this worker is building
     static BUILDING: std::cell::RefCell<Option<Arc<Pending>>> = const { std::cell::RefCell::new(None) };
+    /// a build on this thread that is not a worker's: whether one of the title's threads waits for it (`build_waited_on`)
+    static WAITED: std::cell::RefCell<Option<Box<dyn Fn() -> bool>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// This thread is a worker and one of the title's threads waits for what it is building: the
-/// build must not stand back for the title's sake (`real::big_compile_turn`).
+/// build must not stand back for the title's sake (`real::big_compile_turn`). The same for a
+/// build in `build_waited_on` once its `waited` says so.
 pub(super) fn build_is_wanted() -> bool {
     BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| p.demand.lock().unwrap().wanted))
+        || WAITED.with(|w| w.borrow().as_ref().is_some_and(|f| f()))
+}
+
+/// `build` on a thread that is not a worker, for a pipeline the title may come to wait for: while
+/// `waited` says one of the title's threads does, `build_is_wanted` says so on this thread.
+pub(super) fn build_waited_on<R>(waited: impl Fn() -> bool + 'static, build: impl FnOnce() -> R) -> R {
+    WAITED.with(|w| *w.borrow_mut() = Some(Box::new(waited)));
+    let r = build();
+    WAITED.with(|w| *w.borrow_mut() = None);
+    r
 }
 
 /// Whether one of the title's threads waits for what this thread is doing, to be asked later and

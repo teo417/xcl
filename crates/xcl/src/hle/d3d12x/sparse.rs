@@ -1757,6 +1757,14 @@ pub unsafe fn committed(a: usize, n: usize) {
     s.commit_range(a, n);
 }
 
+/// Whether every page of `[a, a + n)` is one the title committed in a sparse window, as far as
+/// the tiles' bookkeeping says. `false` also when it cannot tell (another thread holds the
+/// state): the caller asks the system then. `VirtualQuery` walks a region to its end to size it:
+/// ~17 ms a call at the start of a written, write-watched 2 GB heap (`XCL_COHERENT_HEAPS=sparse`).
+pub fn range_committed(a: usize, n: usize) -> bool {
+    STATE.try_lock().is_ok_and(|g| g.as_ref().is_some_and(|s| s.range_committed(a, n)))
+}
+
 /// The title decommitted `[a, a + n)`: tiles whose pages are all uncommitted (whether in one
 /// full-tile decommit or incrementally via sub-tile decommits) give their video memory back
 /// (unless a placed buffer still pins the pool tile).
@@ -1774,6 +1782,24 @@ pub unsafe fn decommitted(a: usize, n: usize) {
 }
 
 impl State {
+    /// `range_committed` with the state locked
+    fn range_committed(&self, a: usize, n: usize) -> bool {
+        let Some(end) = a.checked_add(n).filter(|_| n != 0) else { return false };
+        let mut t = a & !(TILE - 1);
+        while t < end {
+            let Some(entry) = self.mapped.get(&t) else { return false };
+            let first = (a.max(t) - t) / PAGE;
+            let last = ((end - t).min(TILE) - 1) / PAGE;
+            let wanted = (u16::MAX >> (PAGES_PER_TILE - 1 - last)) & (u16::MAX << first);
+            if entry.holes & wanted != 0 {
+                return false;
+            }
+            let Some(next) = t.checked_add(TILE) else { break };
+            t = next;
+        }
+        true
+    }
+
     /// `committed` with the state locked
     unsafe fn commit_range(&mut self, a: usize, n: usize) {
         self.ensure_mapped(a, n, |_| 0xFFFF);
@@ -3152,6 +3178,31 @@ mod tests {
             unsafe {
                 let _ = self.0.Signal(self.1);
             }
+        }
+    }
+
+    #[test]
+    fn range_committed_is_true_only_where_every_page_was_committed() {
+        use windows_sys::Win32::System::Memory::MEM_RELEASE;
+        unsafe {
+            let (base, mut s) = test_state_with_reserved(4);
+            // all but the first and last page of tiles 0 and 1
+            s.commit_range(base + PAGE, 2 * TILE - 2 * PAGE);
+            assert!(s.range_committed(base + PAGE, 2 * TILE - 2 * PAGE));
+            assert!(s.range_committed(base + PAGE + 7, 1));
+            assert!(s.range_committed(base + TILE - 1, 2), "across a tile boundary");
+            assert!(!s.range_committed(base, 1), "the first page is a hole");
+            assert!(!s.range_committed(base + PAGE - 1, 2), "starts in a hole");
+            assert!(!s.range_committed(base + 2 * TILE - PAGE - 1, 2), "ends in a hole");
+            assert!(!s.range_committed(base + 2 * TILE, 1), "no tile");
+            assert!(!s.range_committed(base + PAGE, 0));
+            assert!(!s.range_committed(usize::MAX - 1, 4), "no overflow");
+            s.decommit_range(base + TILE, TILE);
+            assert!(s.range_committed(base + PAGE, TILE - PAGE));
+            assert!(!s.range_committed(base + TILE, 1), "decommitted");
+            s.wait_for(s.value);
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
         }
     }
 

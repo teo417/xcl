@@ -821,7 +821,7 @@ unsafe fn read_own(at: usize, out: *mut u8, len: usize) -> bool {
 fn writable(p: usize, n: usize) -> bool {
     let Some(end) = p.checked_add(n) else { return false };
     crate::hle::kernelx::lazy::ensure(p, n);
-    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(p, n)) {
+    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(p, n) || u.is_sparse(p) && crate::hle::d3d12x::sparse::range_committed(p, n)) {
         return true;
     }
     let mut at = p;

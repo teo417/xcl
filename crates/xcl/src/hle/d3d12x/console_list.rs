@@ -74,15 +74,18 @@ pub struct Layout {
     pub size: u32,
     pub inline: u32,
     pub inline_gfx: u32,
+    pub inline_ms: u32,
 }
 
 /// User SGPRs the console's compiler gives root arguments: compute s4…s15 (s0…s3 are the
 /// driver's), graphics stages (VS, PS) s8…s31 (s0…s7: the driver's, s[4:5] of a VS the
-/// fetch shader) – both measured on its output (`tests/console_shaders.rs`).
+/// fetch shader), mesh stage s16…s31 – measured on its output (`tests/console_shaders.rs`).
 const INLINE_SGPRS: u32 = 12;
 const INLINE_SGPRS_GFX: u32 = 24;
+const INLINE_SGPRS_MS: u32 = 16;
 const FIRST_SGPR: usize = 4;
 const FIRST_SGPR_GFX: usize = 8;
+const FIRST_SGPR_MS: usize = 16;
 /// Most bytes of root arguments a layout has. The PC's limit is 64 DWORDs (256 bytes: a
 /// constant or a table 1, a root descriptor 2, D3D12 "Root Signature Limits"); the console's
 /// is not known, so 16 times that. A malformed blob (a count of 0x3FFF_FFFF constants) gets no
@@ -104,7 +107,7 @@ pub fn layout_from_blob(blob: &[u8]) -> Option<Layout> {
     // the parameters go into user SGPRs in order while each fits whole; from the first one
     // that does not, the rest go to the table (packed from its start) – as the console's
     // compiler expects them (HANDOFF: root argument binding)
-    let (mut spilled, mut spilled_gfx) = (false, false);
+    let (mut spilled, mut spilled_gfx, mut spilled_ms) = (false, false, false);
     for k in 0..n {
         let (ty, pay) = (r(poff + 12 * k)?, r(poff + 12 * k + 8)? as usize);
         let p = match ty {
@@ -126,6 +129,10 @@ pub fn layout_from_blob(blob: &[u8]) -> Option<Layout> {
         spilled_gfx |= l.inline_gfx + bytes > 4 * INLINE_SGPRS_GFX;
         if !spilled_gfx {
             l.inline_gfx += bytes;
+        }
+        spilled_ms |= l.inline_ms + bytes > 4 * INLINE_SGPRS_MS;
+        if !spilled_ms {
+            l.inline_ms += bytes;
         }
         l.size = size;
         l.params.push(p);
@@ -170,6 +177,20 @@ pub fn user_data_gfx(l: &Layout, args: &[u8], table_at: u64) -> Vec<u32> {
     sgprs(FIRST_SGPR_GFX, l.inline_gfx, args, table_at)
 }
 
+/// `user_data` of a mesh pass: argument table at s[8:9], inline arguments from s16.
+pub fn user_data_ms(l: &Layout, args: &[u8], table_at: u64) -> Vec<u32> {
+    let mut s = vec![0u32; FIRST_SGPR_MS];
+    s[8] = table_at as u32;
+    s[9] = (table_at >> 32) as u32;
+    let inline = &args[..(l.inline_ms as usize).min(args.len())];
+    s.extend(inline.chunks(4).map(|c| {
+        let mut w = [0u8; 4];
+        w[..c.len()].copy_from_slice(c);
+        u32::from_le_bytes(w)
+    }));
+    s
+}
+
 fn sgprs(first: usize, inline: u32, args: &[u8], table_at: u64) -> Vec<u32> {
     let mut s = vec![0u32; first];
     s[0] = table_at as u32;
@@ -194,6 +215,15 @@ pub fn note_root_signature(rs: usize, blob: &[u8]) {
 
 pub(super) fn layout_of(rs: usize) -> Option<Arc<Layout>> {
     LAYOUTS.lock().unwrap().as_ref()?.get(&rs).cloned()
+}
+
+/// Both are the layout of the same root signature object (not merely of one at a freed address).
+pub(super) fn same_layout(a: &Option<Arc<Layout>>, b: &Option<Arc<Layout>>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -331,6 +361,7 @@ pub fn allocator_reset(allocator: *mut c_void) {
     if let Some(b) = blocks {
         unsafe { free_uma(&b) };
     }
+    super::bind::release_allocator_res(allocator as usize);
 }
 
 fn with_list<R>(obj: usize, f: impl FnOnce(&mut ListState) -> R) -> Option<R> {
@@ -770,8 +801,11 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                 at += 7;
             } else if w0 == RS_MARKER {
                 let r = get(2) as usize | (get(3) as usize) << 32;
-                layout = layout_of(r);
-                table = vec![0u8; layout.as_ref().map_or(0, |l| l.size as usize)];
+                let new = layout_of(r);
+                if !same_layout(&layout, &new) {
+                    table = vec![0u8; new.as_ref().map_or(0, |l| l.size as usize)];
+                }
+                layout = new;
                 at += 4;
             } else if w0 == HEAPS_MARKER {
                 let n = get(1) as usize;
@@ -1060,6 +1094,21 @@ mod tests {
         let l = layout_from_blob(&rts0(&[(1, 1), (4, 0), (1, 11)])).unwrap();
         let args: Vec<u8> = [7u32, 0x1000, 4].iter().flat_map(|w| w.to_le_bytes()).chain([0u8; 44]).collect();
         assert_eq!(user_data(&l, &args, 0x4_0000_0100), vec![0x100, 4, 0, 0, 7, 0x1000, 4]);
+    }
+
+    #[test]
+    fn mesh_arguments_go_in_user_sgprs_from_s16() {
+        let inline = |p: &[(u32, u32)]| layout_from_blob(&rts0(p)).unwrap().inline_ms;
+        assert_eq!(inline(&[(1, 2), (2, 0), (0, 0)]), 20);
+        assert_eq!(inline(&[(1, 14), (2, 0)]), 64);
+        assert_eq!(inline(&[(1, 15), (2, 0)]), 60);
+        assert_eq!(inline(&[(1, 17), (2, 0)]), 0);
+        let l = layout_from_blob(&rts0(&[(1, 2), (2, 0), (0, 0)])).unwrap();
+        let args: Vec<u8> = [1u32, 2, 0x5000, 4, 0x80].iter().flat_map(|w| w.to_le_bytes()).collect();
+        let got = user_data_ms(&l, &args, 0x7_0000_0200);
+        assert_eq!(got[8], 0x200);
+        assert_eq!(got[9], 7);
+        assert_eq!(&got[16..], &[1, 2, 0x5000, 4, 0x80]);
     }
 
     /// The same for a vertex / pixel shader: from s8, 24 SGPRs (the console compiler's output).

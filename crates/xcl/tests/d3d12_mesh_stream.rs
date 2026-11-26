@@ -2,8 +2,8 @@
 //! (`d3d12x::real::dev_create_pipeline_state` / `translated_mesh_stream`), with no game data.
 //!
 //! Runs on any D3D12 adapter (AMD, NVIDIA, Intel, or WARP) with zero vendor-specific skips:
-//! 1. Synthetic console MS placed in the AS slot with no MS slot is refused cleanly with
-//!    `E_INVALIDARG` and records the `"in the AS slot – refused"` error.
+//! 1. Synthetic console MS at subobject 24 with no 25 (the console's MS number, the PC's AS) is
+//!    translated as the mesh shader; with no hardware code it is refused with `E_INVALIDARG`.
 //! 2. Synthetic console MS paired with an AS subobject is refused cleanly with `E_INVALIDARG`.
 //! 3. Empty, truncated, unknown-subobject, and unreadable-shader pipeline streams fail cleanly
 //!    without panicking or crashing.
@@ -74,14 +74,14 @@ fn bytecode(b: &[u8]) -> D3D12_SHADER_BYTECODE {
 }
 
 #[test]
-fn console_ms_in_as_slot_and_ms_with_as_are_refused_cleanly() {
+fn synthetic_console_ms_at_24_and_ms_with_as_are_refused_cleanly() {
     let Some(d2) = device2() else { return };
     let ms = synthetic_console_shader(13);
     let as_blob = synthetic_console_shader(14);
     assert_eq!(xcl::gpu::xbox::parse(&ms).unwrap().stage, "MS");
     assert_eq!(xcl::gpu::xbox::parse(&as_blob).unwrap().stage, "AS");
 
-    // Case 1: console MS placed in the AS slot with no MS slot (#1968 context path)
+    // Case 1: console MS at subobject 24 with no MS slot: read as the console's MS
     #[repr(C)]
     struct AsOnly {
         as_slot: Sub<D3D12_SHADER_BYTECODE>,
@@ -91,11 +91,11 @@ fn console_ms_in_as_slot_and_ms_with_as_are_refused_cleanly() {
         SizeInBytes: std::mem::size_of::<AsOnly>(),
         pPipelineStateSubobjectStream: &st as *const _ as *mut c_void,
     };
-    let err = unsafe { d2.CreatePipelineState::<ID3D12PipelineState>(&desc) }.expect_err("MS in AS slot must be refused");
+    let err = unsafe { d2.CreatePipelineState::<ID3D12PipelineState>(&desc) }.expect_err("an MS with no hardware code must be refused");
     assert_eq!(err.code(), E_INVALIDARG);
     assert!(
-        real::stats().translation_errors.iter().any(|e| e.contains("in the AS slot")),
-        "expected AS-slot refusal in translation_errors: {:?}",
+        real::stats().translation_errors.iter().any(|e| e.contains("MS: no NGG hardware variant")),
+        "expected the mesh shader translation to be refused: {:?}",
         real::stats().translation_errors
     );
 
@@ -175,7 +175,7 @@ fn concurrent_mesh_stream_refusals_across_five_threads_survive() {
                         SizeInBytes: std::mem::size_of::<AsOnly>(),
                         pPipelineStateSubobjectStream: &st as *const _ as *mut c_void,
                     };
-                    let err = unsafe { d2.CreatePipelineState::<ID3D12PipelineState>(&desc) }.expect_err("MS in AS slot");
+                    let err = unsafe { d2.CreatePipelineState::<ID3D12PipelineState>(&desc) }.expect_err("an MS with no hardware code");
                     assert_eq!(err.code(), E_INVALIDARG);
                 } else {
                     let mut trunc = [0u8; 16];

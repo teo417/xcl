@@ -51,6 +51,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 [p, e, d, x, f[0], f[1], f[2], f[3], r, b >> 20, fail]
             };
             let mut last = snap();
+            let mut last_skipped = [0u64; 3];
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 let now = snap();
@@ -67,7 +68,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     K32GetProcessMemoryInfo(windows_sys::Win32::System::Threading::GetCurrentProcess(), &mut c as *mut _ as *mut _, c.cb);
                     c.PrivateUsage
                 };
-                let (local, non_local) = crate::hle::d3d12x::real::video_memory().unwrap_or((0, 0));
+                let (local, non_local, budget) = crate::hle::d3d12x::real::video_memory().unwrap_or((0, 0, 0));
                 let (arenas, arenas_made) = crate::hle::d3d12x::vram::arena_bytes();
                 let (pools, pools_mapped) = crate::hle::d3d12x::sparse::pool_bytes();
                 let (pages, page_pools) = crate::hle::d3d12x::vram::page_bytes();
@@ -84,6 +85,58 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     mb(pools as u64),
                     mb(pools_mapped as u64)
                 );
+                let vl = crate::hle::d3d12x::real::vram_live_bytes();
+                crate::xlog_info!(
+                    "vram-live: budget {} MB local; title_heaps (local {} MB, nonlocal {} MB), committed (local {} MB, nonlocal {} MB)",
+                    mb(budget),
+                    mb(vl[0]),
+                    mb(vl[1]),
+                    mb(vl[2]),
+                    mb(vl[3])
+                );
+                crate::xlog_info!("vram-committed-top: {}", crate::hle::d3d12x::real::committed_top(8));
+                let va = crate::hle::d3d12x::real::vram_alloc_bytes();
+                crate::xlog_info!(
+                    "vram-allocs (cumulative): title heaps {} MB, placed-own {} MB; chain scratch {} MB, cmd_pool {} MB (allocs {} in {} ms, reuses {})",
+                    mb(va[0]),
+                    mb(va[1]),
+                    mb(va[2]),
+                    mb(va[3]),
+                    va[4],
+                    va[6] / 1000,
+                    va[5]
+                );
+                if crate::hle::d3d12x::gpu_timing::enabled() {
+                    let gt = crate::hle::d3d12x::gpu_timing::activity();
+                    crate::xlog_info!(
+                        "gpu-timing (total): {} direct submits ({} lists), {} ms GPU time (max {} ms), {} untimed",
+                        gt[0],
+                        gt[1],
+                        gt[2] / 1000,
+                        gt[3] / 1000,
+                        gt[4]
+                    );
+                    crate::xlog_info!("gpu-cats (total ms): {}", crate::hle::d3d12x::gpu_timing::cat_line());
+                }
+                let pso = crate::hle::d3d12x::pso_async::activity();
+                let pso_active = pso[1].saturating_sub(pso[2] + pso[3]);
+                crate::xlog_info!(
+                    "pso (total): {} submitted, {} started ({} active), {} built, {} failed, {} title_held",
+                    pso[0],
+                    pso[1],
+                    pso_active,
+                    pso[2],
+                    pso[3],
+                    pso[4]
+                );
+                let skipped = crate::hle::d3d12x::bind::skipped_activity();
+                crate::xlog_info!(
+                    "skipped (2 s): {} draws, {} draws left to a stand-in, {} dispatches",
+                    skipped[0] - last_skipped[0],
+                    skipped[1] - last_skipped[1],
+                    skipped[2] - last_skipped[2]
+                );
+                last_skipped = skipped;
                 last = now;
             }
         });

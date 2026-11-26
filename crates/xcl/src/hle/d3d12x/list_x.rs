@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::{transmute_copy, ManuallyDrop};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -46,6 +46,8 @@ const PC_RESOLVE_QUERY_DATA: usize = 54;
 const PC_SET_PREDICATION: usize = 55;
 const PC_OM_SET_DEPTH_BOUNDS: usize = 62;
 const PC_WRITE_BUFFER_IMMEDIATE: usize = 66;
+const PC_RS_SET_SHADING_RATE: usize = 77;
+const PC_RS_SET_SHADING_RATE_IMAGE: usize = 78;
 const PC_QUEUE_EXECUTE_COMMAND_LISTS: usize = 10;
 
 /// Write64BitValueBottomOfPipeX flags 1 / 2, Write64BitValueTopOfPipeX flags 4 / 8: the value
@@ -301,6 +303,8 @@ impl PendingWait {
                 Duration::from_millis(1)
             };
             std::thread::sleep(step);
+            // a value a list wrote into a sparse window reaches this memory with its copy back
+            super::sparse::settle_readbacks_try();
             if self.is_satisfied() {
                 return true;
             }
@@ -342,6 +346,8 @@ struct Bindings {
     index_title: Option<(u64, u32, i32)>,
     /// the title set the console's rect list topology
     rect_list: bool,
+    shading_rate: Option<(u32, Option<[u32; 2]>)>,
+    shading_rate_image: Option<usize>,
 }
 
 /// Whether `list` draws rect lists now, and the title's vertex buffers (slot, (address, bytes, stride)).
@@ -605,6 +611,12 @@ unsafe fn restore_bindings(this: *mut c_void, b: &Bindings, ty: D3D12_COMMAND_LI
             if rt.dsv.is_some() { &d } else { std::ptr::null() },
         );
     }
+    if let Some((base_rate, combiners)) = b.shading_rate {
+        apply_shading_rate_pc(this, base_rate, combiners);
+    }
+    if let Some(image) = b.shading_rate_image {
+        apply_shading_rate_image_pc(this, image);
+    }
 }
 
 #[derive(Default)]
@@ -630,6 +642,9 @@ struct ListState {
     occlusion: Occlusion,
     /// UMA address ranges written by this list since last Reset/KickoffX
     written_ranges: Vec<(u64, u64)>,
+    /// `(va, bytes, value)` of this list's last immediate write to each address (dropped on
+    /// overlapping writes of unknown value such as fill/copy).
+    written_values: Vec<(u64, u64, u64)>,
     /// Sparse-window `(va, bytes)` ranges written by memory ops (`Write32/64`, `Fill*`,
     /// `CopyMemoryToMemoryX`, timestamps) to copy back to the CPU view after execution.
     sparse_writes: Vec<(usize, usize)>,
@@ -662,11 +677,17 @@ pub(super) enum Deferred {
 }
 
 impl ListState {
+    fn clear_written(&mut self) {
+        self.written_ranges.clear();
+        self.written_values.clear();
+    }
+
     fn note_write(&mut self, va: u64, size: u64) {
         if size == 0 {
             return;
         }
         let end = va.saturating_add(size);
+        self.written_values.retain(|&(s, n, _)| !(va < s + n && s < end));
         if self.written_ranges.len() < MAX_WRITTEN_RANGES {
             self.written_ranges.push((va, end));
         } else if let Some(last) = self.written_ranges.last_mut() {
@@ -809,6 +830,8 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
     let key = list as usize;
     // (of a list that was here before and whose release was not seen: the GPU may still use it)
     release_copy_scratch(key);
+    real::dispatch_chain::list_reset(key);
+    super::gpu_timing::cat_drop_list(key);
     let old = {
         let mut g = LISTS.lock().unwrap();
         let m = g.get_or_insert_with(HashMap::new);
@@ -847,6 +870,8 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
 pub(super) fn on_release(list: usize) {
     super::alloc_pool::forget_list(list);
     release_copy_scratch(list);
+    real::dispatch_chain::list_reset(list);
+    super::gpu_timing::cat_drop_list(list);
     super::title_textures::list_reset(list);
     let old = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&list));
     if let Some(old) = old {
@@ -873,7 +898,7 @@ pub(super) fn clear_segment_state(list: usize) {
     super::title_textures::list_reset(list);
     if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&list)) {
         s.occlusion = Occlusion::default();
-        s.written_ranges.clear();
+        s.clear_written();
         s.clear_sparse_writes();
         s.clear_write64_signals();
         s.clear_waits();
@@ -1031,6 +1056,16 @@ fn pick_queue(last_queue: Option<usize>, device: usize, ty: D3D12_COMMAND_LIST_T
 
 fn note_write(list: usize, va: u64, size: u64) {
     LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(list).or_default().note_write(va, size);
+}
+
+/// `note_write` for an immediate write of `words`, retaining its value for `wait_memory`.
+fn note_write_value(list: usize, va: u64, words: &[u32]) {
+    let mut g = LISTS.lock().unwrap();
+    let s = g.get_or_insert_with(HashMap::new).entry(list).or_default();
+    s.note_write(va, 4 * words.len() as u64);
+    if words.len() <= 2 && s.written_values.len() < MAX_WRITTEN_RANGES {
+        s.written_values.push((va, 4 * words.len() as u64, words.iter().rev().fold(0, |v, &w| v << 32 | w as u64)));
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1275,6 +1310,31 @@ unsafe fn prune_title_fence(fence_raw: usize, tf: &mut TitleFenceSync) {
 /// involving title `ID3D12Fence` waits/signals) before any cyclic wait-signal pair reaches Vulkan.
 ///
 /// Returns `true` iff emitting `sig_q.Signal` for `(target_va, sig_val)` would close a cycle.
+/// Returns `true` iff a wait on `wait_val` depends on `sig_val` and is not already satisfied
+/// by an earlier signal `covered`.
+#[inline]
+fn wait_depends_on_new_signal(wait_val: u64, sig_val: u64, covered: u64) -> bool {
+    wait_val <= sig_val && wait_val > covered
+}
+
+fn cell_uncovered_waiters(cell: &SyncCell, sig_val: u64) -> Vec<(usize, u64)> {
+    let covered = cell.submitted_max.max(cell.cpu_signaled_max);
+    cell.armed_waits
+        .iter()
+        .filter(|aw| wait_depends_on_new_signal(aw.val, sig_val, covered))
+        .map(|aw| (aw.waiting_queue, aw.wait_seq))
+        .collect()
+}
+
+fn title_fence_uncovered_waiters(tf: &TitleFenceSync, sig_val: u64) -> Vec<(usize, u64)> {
+    let covered = tf.signals.iter().map(|s| s.val).max().unwrap_or(0);
+    tf.waits
+        .iter()
+        .filter(|&&(v, _, _)| wait_depends_on_new_signal(v, sig_val, covered))
+        .map(|&(_, wq, wseq)| (wq, wseq))
+        .collect()
+}
+
 unsafe fn would_signal_close_cycle(graph: &mut SyncGraph, sig_q: usize, target_va: u64, sig_val: u64) -> bool {
     // Prune completed waits/signals on target cell first.
     let target_waiters: Vec<(usize, u64)> = {
@@ -1283,7 +1343,7 @@ unsafe fn would_signal_close_cycle(graph: &mut SyncGraph, sig_q: usize, target_v
         if completed == u64::MAX || target.armed_waits.is_empty() {
             return false;
         }
-        target.armed_waits.iter().filter(|aw| aw.val <= sig_val).map(|aw| (aw.waiting_queue, aw.wait_seq)).collect()
+        cell_uncovered_waiters(target, sig_val)
     };
     if target_waiters.is_empty() {
         return false;
@@ -1422,7 +1482,7 @@ pub(super) unsafe fn break_cycles_before_title_signal(sig_q: usize, title_fence:
         let Some(graph) = g.as_mut() else { return };
         let Some(tf) = graph.title_fences.get_mut(&title_fence) else { return };
         prune_title_fence(title_fence, tf);
-        let target_waiters: Vec<(usize, u64)> = tf.waits.iter().filter(|&&(v, _, _)| v <= sig_val).map(|&(_, wq, wseq)| (wq, wseq)).collect();
+        let target_waiters = title_fence_uncovered_waiters(tf, sig_val);
         if target_waiters.is_empty() {
             return;
         }
@@ -1524,13 +1584,11 @@ fn wait_expired(aw: &mut ArmedGpuWait, held: bool) -> bool {
 fn wake_sync_watchdog() {
     let pair = sync_watchdog_pair(&SYNC_WATCHDOG_WAKE, || {
         let _ = std::thread::Builder::new().name("xcl-sync-watchdog".into()).spawn(|| loop {
-            let (lock, cv) = SYNC_WATCHDOG_WAKE.get().unwrap();
-            let guard = lock.lock().unwrap();
-            if ARMED_GPU_WAITS.load(Ordering::Acquire) == 0 {
-                let _g = cv.wait(guard).unwrap();
+            let pair = SYNC_WATCHDOG_WAKE.get().unwrap();
+            let Some(guard) = sync_watchdog_sleep_if_idle(pair, &ARMED_GPU_WAITS, || {}) else {
                 continue;
-            }
-            let _ = cv.wait_timeout(guard, Duration::from_millis(50)).unwrap();
+            };
+            let _ = pair.1.wait_timeout(guard, Duration::from_millis(50)).unwrap();
             let (expired, rewinds) = {
                 let mut g = SYNC_GRAPH.lock().unwrap();
                 let mut out: Vec<(u64, u64, ID3D12Fence, usize, i32, Option<usize>, Option<i32>, u64, u64, u64)> = Vec::new();
@@ -1619,6 +1677,27 @@ fn wake_sync_watchdog() {
             }
         });
     });
+    notify_sync_watchdog(pair);
+}
+
+fn sync_watchdog_sleep_if_idle<'a>(
+    pair: &'a (Mutex<()>, Condvar),
+    armed: &AtomicUsize,
+    after_check: impl FnOnce(),
+) -> Option<std::sync::MutexGuard<'a, ()>> {
+    let guard = pair.0.lock().unwrap();
+    if armed.load(Ordering::Acquire) != 0 {
+        return Some(guard);
+    }
+    after_check();
+    let _g = pair.1.wait(guard).unwrap();
+    None
+}
+
+/// Take the pair's lock around `notify_one` so a wake cannot fall between the watchdog's
+/// `armed == 0` check and `Condvar::wait`.
+fn notify_sync_watchdog(pair: &(Mutex<()>, Condvar)) {
+    let _g = pair.0.lock().unwrap();
     pair.1.notify_one();
 }
 
@@ -2455,7 +2534,7 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
         }
         return warn(&N, what, format_args!("{va:#x} is not in unified memory"));
     };
-    note_write(list as usize, va, n);
+    note_write_value(list as usize, va, words);
     let params: Vec<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> = words.iter().enumerate().map(|(i, &w)| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: at + 4 * i as u64, Value: w }).collect();
     let modes = vec![mode; words.len()];
     type F = unsafe extern "system" fn(*mut c_void, u32, *const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, *const D3D12_WRITEBUFFERIMMEDIATE_MODE);
@@ -2649,16 +2728,33 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
 }
 
 /// Gives a dispatch whose pipeline is still being built a segment of its own, recorded at the submit.
-pub(super) unsafe fn defer(list: *mut c_void, what: Deferred) -> bool {
+/// Err: why it could not be put off (the call is then recorded here and waits for its pipeline).
+pub(super) unsafe fn defer(list: *mut c_void, what: Deferred) -> Result<(), super::bind::Cause> {
     if split(list, Some(what)).is_none() {
-        return false;
+        return Err(refusal(list));
     }
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed) + 1;
     if n <= 4 || n.is_power_of_two() {
         crate::xlog_info!("D3D12.X: dispatch with a pipeline still being built put off to the submit (#{n})");
     }
-    true
+    Ok(())
+}
+
+/// Why `split` with a dispatch just said no, from the checks it makes first (in its order).
+unsafe fn refusal(list: *mut c_void) -> super::bind::Cause {
+    use super::bind::Cause;
+    let Some(wrapper) = super::title_list::wrapper_of(list) else { return Cause::BuildingNoWrapper };
+    if !super::title_list::can_split(wrapper, 2) {
+        return Cause::BuildingNoSegments;
+    }
+    if list_type(list) == D3D12_COMMAND_LIST_TYPE_BUNDLE {
+        return Cause::BuildingBundle;
+    }
+    if LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).is_some_and(|s| s.predication.is_some()) {
+        return Cause::BuildingPredicated;
+    }
+    Cause::BuildingPutOffFailed
 }
 
 /// Builds of a submit's put-off calls that go on without the commit headroom, as a title thread's own do: about what the title's threads had in the driver at once before.
@@ -2706,10 +2802,10 @@ pub(super) unsafe fn record_deferred(wrapper: *mut c_void) {
             super::bind::pass_arena(last, seg);
             real::dispatch_chain::list_follows(last as usize, seg as usize);
         }
-        match what {
+        super::bind::at_submit(|| match what {
             Deferred::Dispatch(x, y, z) => super::bind::dispatch(seg, x, y, z),
             Deferred::Indirect(sig, max, args, args_off, count_buf, count_off) => super::bind::execute_indirect(seg, sig, max, args, args_off, count_buf, count_off),
-        }
+        });
         let ext = *(seg as *const usize);
         pc::<unsafe extern "system" fn(*mut c_void) -> i32>(seg, PC_CLOSE)(seg);
         real::preserve_vtable(seg, ext);
@@ -3004,7 +3100,10 @@ unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, va
     let need_split = {
         let mut g = LISTS.lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(list as usize).or_default();
-        if s.has_prior_write(va, n) {
+        // Only drop a same-list wait when an immediate write left a value meeting it;
+        // otherwise another queue produces the waited value.
+        let own = s.written_values.iter().find(|&&(w, len, _)| w == va && len == n);
+        if s.has_prior_write(va, n) && own.is_none_or(|&(_, _, v)| compare_u64(comparison, v & mask, value) == Some(true)) {
             return;
         }
         if s.write64_signals.is_empty() {
@@ -3068,9 +3167,11 @@ pub(super) unsafe extern "system" fn dispatch_x(this: *mut c_void, x: u32, y: u3
     super::bind::dispatch(this, x, y, z);
 }
 
-/// command list #146 console compute/UAV barrier (used by `XboxBvhBuilder.dll` between BVH
-/// build passes): emits a global UAV barrier so UMA writes become visible to the next pass
-pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, _n: u32, _barriers: *const c_void) {
+/// Emit a global UAV barrier on direct/compute lists (D3D12 forbids ResourceBarrier on copy/bundle lists).
+unsafe fn emit_global_uav_barrier(this: *mut c_void) {
+    if this.is_null() || !matches!(list_type(this), D3D12_COMMAND_LIST_TYPE_DIRECT | D3D12_COMMAND_LIST_TYPE_COMPUTE) {
+        return;
+    }
     let b = D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -3080,6 +3181,112 @@ pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, _n: u32, _
     };
     pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(this, PC_RESOURCE_BARRIER)(this, 1, &b);
 }
+
+/// command list #146 console compute/UAV barrier (used by `XboxBvhBuilder.dll` between BVH
+/// build passes): emits a global UAV barrier so UMA writes become visible to the next pass
+pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, _n: u32, _barriers: *const c_void) {
+    emit_global_uav_barrier(this);
+}
+
+/// command list #131 FlushGpuCacheRangeX / #132 FlushShaderCacheRangeX(flags, waitFlags, startVA, size):
+/// emits a global UAV barrier on direct/compute lists when cache/wait flags and size are non-zero.
+pub(super) unsafe extern "system" fn flush_cache_range_x(this: *mut c_void, flags: u32, wait_flags: u32, _start_va: u64, size: u64) {
+    if (flags != 0 || wait_flags != 0) && size != 0 {
+        emit_global_uav_barrier(this);
+    }
+}
+
+/// command list #67 (older) / #69 (newer) FlushPipelineX(flags, startVA, size)
+pub(super) unsafe extern "system" fn flush_pipeline_x(this: *mut c_void, _flags: u32, _start_va: u64, _size: u64) {
+    emit_global_uav_barrier(this);
+}
+
+fn sanitize_shading_rate(base_rate: u32, additional_supported: bool) -> u32 {
+    match base_rate {
+        0 | 1 | 4 | 5 => base_rate,
+        6 | 9 | 10 => if additional_supported { base_rate } else { 5 },
+        _ => 0,
+    }
+}
+
+fn sanitize_combiners(raw: [u32; 2]) -> [u32; 2] {
+    [if raw[0] <= 4 { raw[0] } else { 0 }, if raw[1] <= 4 { raw[1] } else { 0 }]
+}
+
+static CL5_SUPPORTED: AtomicI8 = AtomicI8::new(-1);
+
+unsafe fn supports_cl5(list: *mut c_void) -> bool {
+    match CL5_SUPPORTED.load(Ordering::Acquire) {
+        1 => return true,
+        0 => return false,
+        _ => {}
+    }
+    let Some(cl) = ID3D12GraphicsCommandList::from_raw_borrowed(&list) else {
+        return false;
+    };
+    let ok = cl.cast::<ID3D12GraphicsCommandList5>().is_ok();
+    CL5_SUPPORTED.store(i8::from(ok), Ordering::Release);
+    ok
+}
+
+unsafe fn vsr_caps_of(list: *mut c_void) -> (u32, bool) {
+    if let Some(caps) = device_x::cached_variable_shading_rate_caps() {
+        return caps;
+    }
+    let Some(dev) = device_of(list) else {
+        return (0, false);
+    };
+    device_x::variable_shading_rate_caps(dev.as_raw())
+}
+
+unsafe fn apply_shading_rate_pc(list: *mut c_void, base_rate: u32, combiners: Option<[u32; 2]>) {
+    if list.is_null() || list_type(list) != D3D12_COMMAND_LIST_TYPE_DIRECT || !supports_cl5(list) {
+        return;
+    }
+    let (tier, additional) = vsr_caps_of(list);
+    if tier == 0 {
+        return;
+    }
+    let rate = sanitize_shading_rate(base_rate, additional);
+    let comb_ptr = match (tier >= 2, combiners.as_ref()) {
+        (true, Some(c)) => c as *const [u32; 2],
+        _ => std::ptr::null(),
+    };
+    pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 2])>(list, PC_RS_SET_SHADING_RATE)(list, rate, comb_ptr);
+}
+
+unsafe fn apply_shading_rate_image_pc(list: *mut c_void, image: usize) {
+    if list.is_null() || list_type(list) != D3D12_COMMAND_LIST_TYPE_DIRECT || !supports_cl5(list) {
+        return;
+    }
+    if vsr_caps_of(list).0 < 2 {
+        return;
+    }
+    pc::<unsafe extern "system" fn(*mut c_void, usize)>(list, PC_RS_SET_SHADING_RATE_IMAGE)(list, image);
+}
+
+/// command list #124 (older) / #126 (newer) RSSetShadingRate(baseRate, combiners)
+pub(super) unsafe extern "system" fn rs_set_shading_rate_x(this: *mut c_void, base_rate: u32, combiners: *const [u32; 2]) {
+    let comb = (!combiners.is_null() && crate::gpu::shader::readable(combiners as usize, 8))
+        .then(|| sanitize_combiners(combiners.read_unaligned()));
+    with_bindings(this, |b| b.shading_rate = Some((base_rate, comb)));
+    apply_shading_rate_pc(this, base_rate, comb);
+}
+
+/// command list #125 (older) / #127 (newer) RSSetShadingRateImage(shadingRateImage)
+pub(super) unsafe extern "system" fn rs_set_shading_rate_image_x(this: *mut c_void, image: usize) {
+    with_bindings(this, |b| b.shading_rate_image = Some(image));
+    apply_shading_rate_image_pc(this, image);
+}
+
+/// command list #73 (older) / #75 (newer) SetPipelineFlagX(enable): console-only PSO flag bit
+pub(super) unsafe extern "system" fn set_pipeline_flag_x(_this: *mut c_void, _enable: u32) {}
+
+/// command list #99 (older) / #101 (newer) SetClearBatchHintX(mode, enable)
+pub(super) unsafe extern "system" fn set_clear_batch_hint_x(_this: *mut c_void, _mode: u32, _enable: u32) {}
+
+/// command list #140 (older) / #142 (newer) SetQuadSampleMaskX(mask): 2x2 quad AA sample mask
+pub(super) unsafe extern "system" fn set_quad_sample_mask_x(_this: *mut c_void, _mask: u64) {}
 
 /// command list #84 CopyResourceX(destination, source, flags); in place (the console's
 /// compression operations) there is nothing to do on PC
@@ -3165,6 +3372,12 @@ pub(super) fn on_pc_reset(list: *mut c_void) {
         s.predication = None;
         s.pred_in_state = false;
     }
+}
+
+/// The title's predication (`SetPredicationBufferX`) is set on `list`: what it records now may not run.
+pub(super) fn predicated(list: *mut c_void) -> bool {
+    PREDICATION_USED.load(Ordering::Acquire)
+        && LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).is_some_and(|s| s.predication.is_some())
 }
 
 /// Copy 8 predicate bytes from `(uma_buf, off)` into `pb` with exact barrier transitions and
@@ -3292,7 +3505,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         };
         let sparse_writes = s.clear_sparse_writes();
         let write64_signals = s.clear_write64_signals();
-        s.written_ranges.clear();
+        s.clear_written();
         let cpu_writes = std::mem::take(&mut s.cpu_writes);
         let pred_in_state = std::mem::replace(&mut s.pred_in_state, false);
         let pred_buf = s.pred_buf.as_ref().map(|r| r.as_raw() as usize);
@@ -3388,7 +3601,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             s.pred_buf = pred_buf_obj;
             s.pred_in_state = false;
             s.occlusion = Occlusion { active: None, ended_early };
-            s.written_ranges.clear();
+            s.clear_written();
             s.clear_sparse_writes();
             s.clear_write64_signals();
             s.clear_waits();
@@ -4084,7 +4297,7 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
         s.index_buffer = None;
         s.depth_bounds = None;
         s.occlusion = Occlusion::default();
-        s.written_ranges.clear();
+        s.clear_written();
         s.clear_sparse_writes();
         s.clear_write64_signals();
         s.clear_waits();
@@ -4255,6 +4468,7 @@ pub(super) unsafe extern "system" fn copy_buffer_region_x(this: *mut c_void, dst
             note_gpu_write("CopyBufferRegion", a + dst_off as usize, n);
         }
     }
+    let _cat = super::gpu_timing::CatScope::begin_raw(this, super::gpu_timing::Cat::Copy);
     pc::<unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64)>(this, PC_COPY_BUFFER_REGION)(this, dst, dst_off + real::buffer_delta(dst), src, src_off + real::buffer_delta(src), n)
 }
 
@@ -4355,6 +4569,7 @@ pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, ds
         }
     }
     let (Some(d), Some(s)) = (pc_location(dst), pc_location(src)) else { return };
+    let _cat = super::gpu_timing::CatScope::begin_raw(this, super::gpu_timing::Cat::Copy);
     pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(this, PC_COPY_TEXTURE_REGION)(this, &d, x, y, z, &s, bx);
     std::mem::forget((d, s)); // borrowed resource pointers
 }
@@ -4381,6 +4596,7 @@ pub(super) unsafe extern "system" fn clear_depth_stencil_x(this: *mut c_void, ds
             );
         }
     }
+    let _cat = super::gpu_timing::CatScope::begin_raw(this, super::gpu_timing::Cat::Clear);
     pc::<unsafe extern "system" fn(*mut c_void, usize, u32, f32, u8, u32, *const windows::Win32::Foundation::RECT)>(this, PC_CLEAR_DEPTH_STENCIL_VIEW)(this, dsv, flags, depth, stencil, n, rects)
 }
 
@@ -4422,6 +4638,7 @@ unsafe fn clear_uav(this: *mut c_void, slot: usize, gpu: u64, cpu: u64, res: usi
             return;
         }
     };
+    let _cat = super::gpu_timing::CatScope::begin_raw(this, super::gpu_timing::Cat::Clear);
     pc::<unsafe extern "system" fn(*mut c_void, u64, u64, usize, *const c_void, u32, *const windows::Win32::Foundation::RECT)>(this, slot)(this, gpu, cpu, res, values, n, rects)
 }
 
@@ -4465,6 +4682,7 @@ unsafe fn trace_resolve(what: &str, dst: usize, src: usize, format: i32, extra: 
 pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, dst: usize, dst_sub: u32, src: usize, src_sub: u32, format: i32) {
     super::present::note_use(dst, super::present::USE_COPY);
     trace_resolve("ResolveSubresource", dst, src, format, "");
+    let _cat = super::gpu_timing::CatScope::begin_raw(this, super::gpu_timing::Cat::Clear);
     pc::<unsafe extern "system" fn(*mut c_void, usize, u32, usize, u32, i32)>(this, PC_RESOLVE_SUBRESOURCE)(this, dst, dst_sub, src, src_sub, format)
 }
 
@@ -4476,6 +4694,7 @@ pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_v
     if super::present::trace_frame() {
         trace_resolve("ResolveSubresourceRegion", dst, src, format, &format!(" mode {mode} at ({x}, {y}) rect {:?}", rect.as_ref().map(|r| (r.left, r.top, r.right, r.bottom))));
     }
+    let _cat = super::gpu_timing::CatScope::begin_raw(this, super::gpu_timing::Cat::Clear);
     pc::<unsafe extern "system" fn(*mut c_void, usize, u32, u32, u32, usize, u32, *const windows::Win32::Foundation::RECT, i32, i32)>(this, PC_RESOLVE_SUBRESOURCE_REGION)(this, dst, dst_sub, x, y, src, src_sub, rect, format, mode)
 }
 
@@ -4489,6 +4708,7 @@ pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usi
     }
     let (dd, sd) = (real::buffer_delta(dst), real::buffer_delta(src));
     if dd == 0 && sd == 0 {
+        let _cat = super::gpu_timing::CatScope::begin_raw(this, super::gpu_timing::Cat::Copy);
         return pc::<unsafe extern "system" fn(*mut c_void, usize, usize)>(this, PC_COPY_RESOURCE)(this, dst, src);
     }
     let n = real::console_buffer(dst).or(real::console_buffer(src)).map_or(0, |b| b.1 as u64);
@@ -4593,6 +4813,21 @@ pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, hea
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// A list made at the address of a released one does not share the split programs' scratch
+    /// of the old one's recordings, which the GPU may still run (#2588: addresses are reused)
+    #[test]
+    fn a_list_at_a_released_lists_address_starts_without_its_chain_scratch() {
+        let list = 0x7a51_0000usize;
+        real::dispatch_chain::note_shared_for_test(list, 0x333);
+        on_release(list);
+        assert!(!real::dispatch_chain::shares_scratch_for_test(list), "kept after the release");
+        // a release not seen: the create clears it
+        real::dispatch_chain::note_shared_for_test(list, 0x333);
+        unsafe { on_create(list as *mut c_void, 0x333, 0, D3D12_COMMAND_LIST_TYPE_DIRECT) };
+        assert!(!real::dispatch_chain::shares_scratch_for_test(list), "kept by a list created at the address");
+        on_release(list);
+    }
 
     /// An internal wait shows in the watchdog's summary while its fence is short of the value,
     /// and is gone from it once the fence gets there.
@@ -5058,6 +5293,64 @@ mod tests {
             assert!(!s.pso_dirty);
         }
         on_release(key);
+    }
+
+    #[test]
+    fn a_wait_after_an_own_write_is_dropped_only_when_the_written_value_meets_it() {
+        let cell64 = AtomicU64::new(0);
+        let cell32 = AtomicU32::new(0);
+        let (va64, va32) = (&cell64 as *const AtomicU64 as u64, &cell32 as *const AtomicU32 as u64);
+        let mut token = 0usize;
+        let list = (&mut token as *mut usize).cast::<c_void>();
+        let kept = |writes: &[(u64, &[u32])], wait: &dyn Fn()| -> usize {
+            for &(va, words) in writes {
+                note_write_value(list as usize, va, words);
+            }
+            wait();
+            let n = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).map_or(0, |s| s.pending_waits.len());
+            on_release(list as usize);
+            n
+        };
+        let w64 = |v: u64| [v as u32, (v >> 32) as u32];
+        use D3D12_COMPARISON_FUNC as F;
+        for (written, op, wanted, keep) in [
+            (0u64, D3D12_COMPARISON_FUNC_GREATER_EQUAL, 1u64, true),
+            (5, D3D12_COMPARISON_FUNC_GREATER_EQUAL, 1, false),
+            (0xFFFF_FFFF, D3D12_COMPARISON_FUNC_GREATER_EQUAL, 1 << 32, true),
+            (0, D3D12_COMPARISON_FUNC_EQUAL, 1, true),
+            (1, D3D12_COMPARISON_FUNC_EQUAL, 1, false),
+            (1, D3D12_COMPARISON_FUNC_NOT_EQUAL, 1, true),
+            (0, D3D12_COMPARISON_FUNC_NOT_EQUAL, 1, false),
+            (1, D3D12_COMPARISON_FUNC_LESS, 1, true),
+            (0, D3D12_COMPARISON_FUNC_LESS, 1, false),
+            (2, D3D12_COMPARISON_FUNC_LESS_EQUAL, 1, true),
+            (1, D3D12_COMPARISON_FUNC_LESS_EQUAL, 1, false),
+            (1, D3D12_COMPARISON_FUNC_GREATER, 1, true),
+            (2, D3D12_COMPARISON_FUNC_GREATER, 1, false),
+            (0, D3D12_COMPARISON_FUNC_ALWAYS, 1, false),
+            (0, D3D12_COMPARISON_FUNC_NEVER, 1, false),
+        ] {
+            let F(op) = op;
+            let got = kept(&[(va64, &w64(written))], &|| unsafe { wait64_x(list, va64, op as u32, wanted, 0, 0) });
+            assert_eq!(got, keep as usize, "64-bit: wrote {written:#x}, wait op {op} {wanted:#x}");
+            if wanted <= u32::MAX as u64 && written <= u32::MAX as u64 {
+                let got = kept(&[(va32, &[written as u32])], &|| unsafe { wait32_x(list, va32, op as u32, wanted as u32, u32::MAX, 0) });
+                assert_eq!(got, keep as usize, "32-bit: wrote {written:#x}, wait op {op} {wanted:#x}");
+            }
+        }
+        let ge = D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32;
+        let eq = D3D12_COMPARISON_FUNC_EQUAL.0 as u32;
+        assert_eq!(kept(&[(va32, &[0x1234_00FF])], &|| unsafe { wait32_x(list, va32, eq, 0xFF, 0xFF, 0) }), 0);
+        assert_eq!(kept(&[(va32, &[0x0000_12FE])], &|| unsafe { wait32_x(list, va32, eq, 0xFF, 0xFF, 0) }), 1);
+        assert_eq!(kept(&[(va64, &w64(5)), (va64, &w64(0))], &|| unsafe { wait64_x(list, va64, ge, 1, 0, 0) }), 1);
+        assert_eq!(kept(&[(va64, &w64(0)), (va64, &w64(5))], &|| unsafe { wait64_x(list, va64, ge, 1, 0, 0) }), 0);
+        assert_eq!(kept(&[(va32, &[5])], &|| unsafe { wait64_x(list, va64, ge, 1, 0, 0) }), 1);
+        let fill = || {
+            note_write_value(list as usize, va64, &w64(0));
+            note_write(list as usize, va64, 8);
+            unsafe { wait64_x(list, va64, ge, 1, 0, 0) }
+        };
+        assert_eq!(kept(&[], &fill), 0);
     }
 
     #[test]
@@ -5795,6 +6088,7 @@ mod tests {
                     PredEvent::SetPred(pb_raw, 0, D3D12_PREDICATION_OP_EQUAL_ZERO),
                 ]
             );
+            assert!(predicated(list_ptr));
 
             // Rejections while a predicate is active must neither emit events nor disturb tracked state.
             for ty in [D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_COMPUTE] {
@@ -5867,11 +6161,14 @@ mod tests {
             );
             set_predication_buffer_x(list_ptr, std::ptr::null());
             assert_eq!(take_events(), vec![PredEvent::SetPred(0, 0, D3D12_PREDICATION_OP_EQUAL_ZERO)]);
+            assert!(!predicated(list_ptr));
 
             // (g) on_pc_reset clears predication & pred_in_state so subsequent before_close emits 0 barriers.
             apply_predication_copy(list_ptr, uma_buf, 0x100, pb_raw, D3D12_PREDICATION_OP_EQUAL_ZERO);
             take_events();
+            assert!(predicated(list_ptr));
             on_pc_reset(list_ptr);
+            assert!(!predicated(list_ptr));
             before_close(list_ptr);
             assert!(take_events().is_empty(), "on_pc_reset must clear pred_in_state before before_close");
         }
@@ -6396,6 +6693,74 @@ mod tests {
             VirtualFree(sparse_va as *mut c_void, 0x1000, MEM_DECOMMIT);
             assert!(uma.sparse_release(sparse_va).is_some());
         }
+    }
+
+    #[test]
+    fn covered_sync_waits_do_not_close_cycles() {
+        let mut cell = SyncCell {
+            submitted_max: 0x6db,
+            cpu_signaled_max: 0,
+            armed_waits: vec![
+                ArmedGpuWait {
+                    val: 0x6db,
+                    waiting_queue: 0xD001,
+                    waiting_queue_ty: D3D12_COMMAND_LIST_TYPE_DIRECT.0,
+                    wait_seq: 3544,
+                    armed_at: Instant::now(),
+                    after_write64: false,
+                },
+                ArmedGpuWait {
+                    val: 0x6dc,
+                    waiting_queue: 0xD001,
+                    waiting_queue_ty: D3D12_COMMAND_LIST_TYPE_DIRECT.0,
+                    wait_seq: 3550,
+                    armed_at: Instant::now(),
+                    after_write64: false,
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(cell_uncovered_waiters(&cell, 0x6dc), vec![(0xD001, 3550)]);
+
+        cell.cpu_signaled_max = 0x6dc;
+        assert!(cell_uncovered_waiters(&cell, 0x6dc).is_empty());
+
+        let mut tf = TitleFenceSync::default();
+        tf.signals.push(SubmittedSignal { val: 1, queue: 0xC0F1, seq: 3 });
+        tf.waits.push((1, 0xC0F0, 5));
+        tf.waits.push((2, 0xC0F0, 6));
+        tf.waits.push((3, 0xC0F0, 7));
+        assert_eq!(title_fence_uncovered_waiters(&tf, 2), vec![(0xC0F0, 6)]);
+    }
+
+    #[test]
+    fn a_wait_armed_during_the_watchdogs_check_wakes_it() {
+        use std::sync::{mpsc, Arc};
+        let pair = Arc::new((Mutex::new(()), Condvar::new()));
+        let armed = Arc::new(AtomicUsize::new(0));
+        let (checked_tx, checked_rx) = mpsc::channel();
+        let (notified_tx, notified_rx) = mpsc::channel::<()>();
+        let (woke_tx, woke_rx) = mpsc::channel();
+        let (p, a) = (pair.clone(), armed.clone());
+        let watchdog = std::thread::spawn(move || {
+            let slept = sync_watchdog_sleep_if_idle(&p, &a, || {
+                checked_tx.send(()).unwrap();
+                let _ = notified_rx.recv_timeout(Duration::from_millis(200));
+            })
+            .is_none();
+            woke_tx.send(slept).unwrap();
+        });
+        checked_rx.recv().unwrap();
+        armed.fetch_add(1, Ordering::AcqRel);
+        notify_sync_watchdog(&pair);
+        let _ = notified_tx.send(());
+        let woke = woke_rx.recv_timeout(Duration::from_secs(2));
+        if woke.is_err() {
+            pair.1.notify_one();
+        }
+        watchdog.join().unwrap();
+        assert_eq!(woke, Ok(true), "watchdog slept through the arm's notify");
+        assert!(sync_watchdog_sleep_if_idle(&pair, &armed, || unreachable!()).is_some());
     }
 
     /// A CPU cycle-break (`SignalAction::CpuCycleBreak` and `break_cycles_before_title_signal`)
@@ -7057,7 +7422,7 @@ mod tests {
             assert_eq!(close_fn(wrap), 0);
             assert!(pso_async::is_pending(standin), "Close waited for the build");
 
-            let skipped = bind::counts_snapshot()[4];
+            let (skipped, failed) = (bind::counts_snapshot()[4], bind::cause_count(bind::Cause::BuildFailed));
             let build = std::thread::spawn(|| {
                 std::thread::sleep(Duration::from_millis(300));
                 BUILD.store(true, Ordering::Release);
@@ -7065,6 +7430,7 @@ mod tests {
             record_deferred(wrap);
             assert!(!pso_async::is_pending(standin), "the submit waits for the build");
             assert!(bind::counts_snapshot()[4] > skipped, "the dispatch of a build that failed is skipped, at the submit");
+            assert!(bind::cause_count(bind::Cause::BuildFailed) > failed, "and counted as a failed build");
             build.join().unwrap();
 
             type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
@@ -7076,6 +7442,70 @@ mod tests {
             let rel_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(2));
             assert_eq!(rel_fn(wrap), 0);
             let _ = pso_async::released(standin);
+        }
+    }
+
+    #[test]
+    fn a_dispatch_that_cannot_be_put_off_is_counted_by_why() {
+        use super::super::{bind, pso_async, title_list};
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let warp = CreateDXGIFactory1::<IDXGIFactory4>().and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>());
+                if warp.and_then(|w| D3D12CreateDevice(&w, D3D_FEATURE_LEVEL_11_0, &mut dev)).is_err() {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                }
+            }
+            let dev = dev.unwrap();
+            // (a pipeline still being built, that no bind waits for: `image_only`)
+            static BUILD: AtomicBool = AtomicBool::new(false);
+            let mut standins = Vec::new();
+            for (n, ty, predicated, cause) in [
+                (1usize, D3D12_COMMAND_LIST_TYPE_BUNDLE, false, bind::Cause::BuildingBundle),
+                (2, D3D12_COMMAND_LIST_TYPE_COMPUTE, true, bind::Cause::BuildingPredicated),
+            ] {
+                let standin = 0x7E57_D100usize + n;
+                standins.push(standin);
+                pso_async::submit(
+                    standin,
+                    true,
+                    Box::new(|| {
+                        let t = std::time::Instant::now();
+                        while !BUILD.load(Ordering::Acquire) && t.elapsed() < std::time::Duration::from_secs(10) {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        0
+                    }),
+                );
+                pso_async::image_only(standin);
+                let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+                let raw: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, None).unwrap();
+                let pc0 = raw.into_raw();
+                real::adopt(pc0, real::Kind::CommandList);
+                on_create(pc0, alloc.as_raw() as usize, 0, ty);
+                bind::reset(pc0, alloc.as_raw() as usize, standin);
+                let wrap = title_list::wrap(pc0);
+                if predicated {
+                    LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(pc0 as usize).or_default().predication = Some(D3D12_PREDICATION_OP_EQUAL_ZERO);
+                }
+
+                let before = (bind::cause_count(cause), bind::local_skips());
+                bind::dispatch(pc0, 1, 1, 1);
+                let after = (bind::cause_count(cause), bind::local_skips());
+                assert_eq!(after.0, before.0 + 1, "{cause:?}");
+                assert_eq!((after.1 .0 - before.1 .0, after.1 .1 - before.1 .1), (1, 1), "one skip, under {cause:?} only");
+
+                let rel_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(2));
+                rel_fn(wrap);
+            }
+            BUILD.store(true, Ordering::Release);
+            for standin in standins {
+                let _ = pso_async::released(standin);
+            }
         }
     }
 
@@ -7430,6 +7860,91 @@ mod tests {
             console_heap::unregister(co);
             console_heap::unregister(go);
             assert!(got.iter().all(|&v| v == 0xDEAD_BEEF), "the UAV was not cleared: {:x?}", &got[..4]);
+        }
+    }
+
+    #[test]
+    fn shading_rate_and_combiner_sanitization() {
+        assert_eq!(sanitize_shading_rate(0, false), 0);
+        assert_eq!(sanitize_shading_rate(1, false), 1);
+        assert_eq!(sanitize_shading_rate(4, false), 4);
+        assert_eq!(sanitize_shading_rate(5, false), 5);
+        assert_eq!(sanitize_shading_rate(6, false), 5);
+        assert_eq!(sanitize_shading_rate(9, false), 5);
+        assert_eq!(sanitize_shading_rate(10, false), 5);
+        assert_eq!(sanitize_shading_rate(6, true), 6);
+        assert_eq!(sanitize_shading_rate(9, true), 9);
+        assert_eq!(sanitize_shading_rate(10, true), 10);
+        assert_eq!(sanitize_shading_rate(2, true), 0);
+        assert_eq!(sanitize_shading_rate(99, false), 0);
+        assert_eq!(sanitize_combiners([0, 4]), [0, 4]);
+        assert_eq!(sanitize_combiners([5, 99]), [0, 0]);
+        assert_eq!(sanitize_combiners([3, 8]), [3, 0]);
+    }
+
+    #[test]
+    fn cache_flushes_and_console_list_slots_emit_safe_barriers() {
+        #[repr(C)]
+        struct FakeBarrierList {
+            vt: *const usize,
+            ty: i32,
+            barriers: Mutex<Vec<u32>>,
+        }
+        unsafe extern "system" fn fake_get_type(this: *mut c_void) -> D3D12_COMMAND_LIST_TYPE {
+            D3D12_COMMAND_LIST_TYPE((*(this as *const FakeBarrierList)).ty)
+        }
+        unsafe extern "system" fn fake_barrier(this: *mut c_void, count: u32, barriers: *const D3D12_RESOURCE_BARRIER) {
+            let mut g = (*(this as *const FakeBarrierList)).barriers.lock().unwrap();
+            for i in 0..count as usize {
+                g.push((*barriers.add(i)).Type.0 as u32);
+            }
+        }
+        unsafe extern "system" fn fake_reset(_this: *mut c_void, _alloc: usize, _pso: usize) -> i32 {
+            0
+        }
+
+        let mut orig_vt = [0usize; 32];
+        orig_vt[PC_GET_TYPE] = fake_get_type as usize;
+        orig_vt[PC_RESET] = fake_reset as usize;
+        orig_vt[PC_RESOURCE_BARRIER] = fake_barrier as usize;
+        let mut ext_vt = [0usize; 2];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+
+        let mut fake = Box::new(FakeBarrierList {
+            vt: unsafe { ext_vt.as_ptr().add(1) },
+            ty: D3D12_COMMAND_LIST_TYPE_DIRECT.0,
+            barriers: Mutex::new(Vec::new()),
+        });
+        let list_ptr = &mut *fake as *mut FakeBarrierList as *mut c_void;
+        unsafe {
+            set_pipeline_flag_x(list_ptr, 1);
+            set_quad_sample_mask_x(list_ptr, 0xFFFF_0000_FFFF_0000);
+            set_clear_batch_hint_x(list_ptr, 2, 1);
+            assert!(fake.barriers.lock().unwrap().is_empty());
+
+            // Zero flags or zero size emit no barrier; non-zero on DIRECT/COMPUTE emits UAV barrier.
+            flush_cache_range_x(list_ptr, 0, 0, 0, 0x1000);
+            flush_cache_range_x(list_ptr, 0xc3c0, 0, 0, 0);
+            assert!(fake.barriers.lock().unwrap().is_empty());
+
+            flush_cache_range_x(list_ptr, 0xc3c0, 0x8002_0000, 0, 0xFFFF_FFFF_FF00);
+            flush_cache_range_x(list_ptr, 0x70_0000, 0, 0, 0xFFFF_FFFF_FF00);
+            flush_pipeline_x(list_ptr, 1, 0, 0);
+            assert_eq!(*fake.barriers.lock().unwrap(), vec![D3D12_RESOURCE_BARRIER_TYPE_UAV.0 as u32; 3]);
+
+            // COMPUTE also emits UAV barriers; COPY and BUNDLE do not.
+            fake.ty = D3D12_COMMAND_LIST_TYPE_COMPUTE.0;
+            flush_cache_range_x(list_ptr, 1, 0, 0, 0x100);
+            assert_eq!(fake.barriers.lock().unwrap().len(), 4);
+            for blocked in [D3D12_COMMAND_LIST_TYPE_COPY.0, D3D12_COMMAND_LIST_TYPE_BUNDLE.0] {
+                fake.ty = blocked;
+                flush_cache_range_x(list_ptr, 0xc3c0, 0, 0, 0x100);
+                flush_pipeline_x(list_ptr, 1, 0, 0);
+            }
+            assert_eq!(fake.barriers.lock().unwrap().len(), 4);
+
+            assert_eq!(reset_x(list_ptr, 0, 0), 0);
+            on_release(list_ptr as usize);
         }
     }
 }

@@ -38,6 +38,8 @@ const IID_GRAPHICS_COMMAND_LIST: GUID = GUID::from_u128(0x5b160d0f_ac1b_4185_8ba
 const IID_PIPELINE_STATE: GUID = GUID::from_u128(0x765a30f3_f624_4c6f_a828_ace948622445);
 /// D3D12_INDIRECT_ARGUMENT_TYPE of the console's DispatchX
 const XBOX_ARG_DISPATCH_X: u32 = 105;
+/// D3D12_INDIRECT_ARGUMENT_TYPE of the console's DispatchMesh
+const XBOX_ARG_DISPATCH_MESH_X: u32 = 107;
 
 fn guid_bytes(g: &GUID) -> (u32, u16, u16, [u8; 8]) {
     (g.data1, g.data2, g.data3, g.data4)
@@ -187,6 +189,47 @@ pub(super) unsafe fn dynamic_depth_bias_supported(dev: *mut c_void) -> bool {
         return false;
     }
     ID3D12Device::from_raw_borrowed(&dev).is_some_and(probe_dynamic_depth_bias)
+}
+
+/// Cached `CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS6)` result:
+/// -1 = unprobed, otherwise `(tier & 3) | ((additional_rates as i8) << 2)`.
+static VSR_CAPS: AtomicI8 = AtomicI8::new(-1);
+
+fn probe_vsr_caps(dev: &ID3D12Device) -> (u32, bool) {
+    let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS6::default();
+    let ok = unsafe {
+        dev.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS6,
+            &mut opts as *mut _ as *mut c_void,
+            std::mem::size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS6>() as u32,
+        )
+        .is_ok()
+    };
+    let (tier, additional) = if ok {
+        ((opts.VariableShadingRateTier.0 as u32).min(3), opts.AdditionalShadingRatesSupported.as_bool())
+    } else {
+        (0, false)
+    };
+    VSR_CAPS.store((tier as i8) | ((additional as i8) << 2), Ordering::Release);
+    crate::xlog_info!("D3D12.X: variable shading rate (OPTIONS6): tier {tier}, additional rates {additional}");
+    (tier, additional)
+}
+
+/// Cached `(VariableShadingRateTier, AdditionalShadingRatesSupported)` if already probed.
+pub(super) fn cached_variable_shading_rate_caps() -> Option<(u32, bool)> {
+    let cached = VSR_CAPS.load(Ordering::Acquire);
+    (cached >= 0).then(|| ((cached & 3) as u32, (cached & 4) != 0))
+}
+
+/// Cached `(VariableShadingRateTier, AdditionalShadingRatesSupported)` for `dev`.
+pub(super) unsafe fn variable_shading_rate_caps(dev: *mut c_void) -> (u32, bool) {
+    if let Some(caps) = cached_variable_shading_rate_caps() {
+        return caps;
+    }
+    if dev.is_null() {
+        return (0, false);
+    }
+    ID3D12Device::from_raw_borrowed(&dev).map_or((0, false), probe_vsr_caps)
 }
 
 /// Create a graphics PSO, enabling `D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS` when the
@@ -623,6 +666,81 @@ pub(super) unsafe extern "system" fn unregister_page_pool_x(_this: *mut c_void, 
         }
         _ => E_FAIL,
     }
+}
+
+const PAGE_64K: u64 = 0x1_0000;
+
+/// command queue #29 (older) / #31 (newer)
+/// `UpdatePageMappingsX(numMappings, pMappings, pagePoolBase, numPagesInPool, flags)`:
+/// validates 64 KiB page mapping descriptors from a GPU page pool and succeeds.
+pub(super) unsafe extern "system" fn update_page_mappings_x(
+    _queue: *mut c_void,
+    num_mappings: u32,
+    mappings: *const u8,
+    page_pool_base: u64,
+    num_pages_in_pool: u32,
+    flags: u32,
+) -> HRESULT {
+    static LOG_ONCE: AtomicU64 = AtomicU64::new(0);
+    static WARN_ONCE: AtomicU64 = AtomicU64::new(0);
+    if num_mappings == 0 {
+        return S_OK;
+    }
+    let Some(bytes) = (num_mappings as usize).checked_mul(24) else {
+        return E_INVALIDARG;
+    };
+    if mappings.is_null() || !crate::gpu::shader::readable(mappings as usize, bytes) {
+        return E_INVALIDARG;
+    }
+    if once(&LOG_ONCE, 1) {
+        crate::xlog_info!("D3D12.X: UpdatePageMappingsX ({num_mappings} mapping(s), pool {page_pool_base:#x}, {num_pages_in_pool} pages, flags {flags:#x})");
+    }
+    for i in 0..num_mappings as usize {
+        let entry = mappings.add(i * 24);
+        let dest_va = (entry as *const u64).read_unaligned();
+        let num_ranges = (entry.add(8) as *const u32).read_unaligned();
+        let ranges_ptr = (entry.add(0x10) as *const usize).read_unaligned();
+        if num_ranges == 0 {
+            continue;
+        }
+        let Some(rbytes) = (num_ranges as usize).checked_mul(12) else {
+            if once(&WARN_ONCE, 4) {
+                crate::xlog_warn!("D3D12.X: UpdatePageMappingsX – range count overflow ({num_ranges})");
+            }
+            return E_INVALIDARG;
+        };
+        if dest_va == 0 || !dest_va.is_multiple_of(PAGE_64K) || ranges_ptr == 0 || !crate::gpu::shader::readable(ranges_ptr, rbytes) {
+            if once(&WARN_ONCE, 4) {
+                crate::xlog_warn!("D3D12.X: UpdatePageMappingsX – invalid mapping dest={dest_va:#x} ranges={ranges_ptr:#x} count={num_ranges}");
+            }
+            return E_INVALIDARG;
+        }
+        for j in 0..num_ranges as usize {
+            let r = (ranges_ptr + j * 12) as *const u8;
+            let op = (r as *const u32).read_unaligned();
+            let pool_idx = (r.add(4) as *const u32).read_unaligned();
+            let page_count = (r.add(8) as *const u32).read_unaligned();
+            match op {
+                0 | 2 => {}
+                1 => {
+                    if page_pool_base == 0 || (pool_idx as u64).checked_add(page_count as u64).is_none_or(|end| end > num_pages_in_pool as u64) {
+                        if once(&WARN_ONCE, 4) {
+                            crate::xlog_warn!(
+                                "D3D12.X: UpdatePageMappingsX – pool range [{pool_idx}..+{page_count}) exceeds {num_pages_in_pool} pages (base {page_pool_base:#x})"
+                            );
+                        }
+                        return E_INVALIDARG;
+                    }
+                }
+                _ => {
+                    if once(&WARN_ONCE, 4) {
+                        crate::xlog_warn!("D3D12.X: UpdatePageMappingsX – unknown page range op {op}");
+                    }
+                }
+            }
+        }
+    }
+    S_OK
 }
 
 /// device #61 CreateSamplerX(desc, destination): the title uses it for anisotropic samplers;
@@ -1234,8 +1352,31 @@ pub(super) unsafe extern "system" fn get_copyable_footprints_x(
     }
 }
 
-/// device #41 CreateCommandSignature(desc, root signature, riid, signature): the console's
-/// DispatchX argument (105) is a PC Dispatch; the root signature only goes with arguments
+/// Map console indirect argument types (DispatchX 105, DispatchMeshX 107) to PC values;
+/// unrecognized by PC debug layer otherwise.
+fn pc_argument_type(t: u32) -> u32 {
+    match t {
+        XBOX_ARG_DISPATCH_X => D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32,
+        XBOX_ARG_DISPATCH_MESH_X => D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH.0 as u32,
+        _ => t,
+    }
+}
+
+fn indirect_arg_bytes(arg: &[u32; 4]) -> u32 {
+    match arg[0] {
+        0 => 16,
+        1 => 20,
+        2 | 10 => 12,
+        3 | 4 => 16,
+        5 => arg[3].saturating_mul(4),
+        6..=8 => 8,
+        9 => 108,
+        _ => 0,
+    }
+}
+
+/// device #41 CreateCommandSignature(desc, root signature, riid, signature): console argument
+/// types become PC ones (`pc_argument_type`); the root signature only goes with arguments
 /// that need one (constants, CBV / SRV / UAV)
 pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_void, desc: *const u8, root: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     if desc.is_null() || ppv.is_null() {
@@ -1247,18 +1388,43 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
     let args = u64::from_le_bytes(pc[8..16].try_into().unwrap()) as *const [u32; 4];
     let mut list: Vec<[u32; 4]> = if args.is_null() || n > 64 { Vec::new() } else { (0..n).map(|i| args.add(i).read_unaligned()).collect() };
     for a in list.iter_mut() {
-        if a[0] == XBOX_ARG_DISPATCH_X {
-            a[0] = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32;
-        }
+        a[0] = pc_argument_type(a[0]);
     }
     let needs_root = list.iter().any(|a| (5..=8).contains(&a[0]));
     pc[8..16].copy_from_slice(&(if list.is_empty() { 0 } else { list.as_ptr() as u64 }).to_le_bytes());
     let hr = real::dev_create_command_signature(this, pc.as_ptr() as usize, if needs_root { root } else { 0 }, riid, ppv);
-    if hr >= 0 && !ppv.is_null() && needs_root {
-        super::bind::note_root_changing_signature(*ppv as usize);
+    if hr < 0 {
+        crate::xlog_warn!(
+            "D3D12.X: CreateCommandSignature stride {} node mask {:#x} root {root:#x} arguments {:?} → {hr:#x}",
+            u32::from_le_bytes(pc[0..4].try_into().unwrap()),
+            u32::from_le_bytes(pc[16..20].try_into().unwrap()),
+            list
+        );
     }
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
-        super::bind::note_signature_dispatches(*ppv as usize, list.iter().any(|a| a[0] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32));
+        let sig = *ppv as usize;
+        super::bind::note_root_changing_signature(sig, needs_root);
+        let mut dm_sig = None;
+        if !needs_root {
+            if let Some(idx) = list.iter().position(|a| a[0] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH.0 as u32) {
+                let offset: u32 = list[..idx].iter().map(indirect_arg_bytes).sum();
+                let byte_stride = u32::from_le_bytes(pc[0..4].try_into().unwrap());
+                let mut dispatch_list = list.clone();
+                dispatch_list[idx][0] = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32;
+                let mut dpc = pc;
+                dpc[8..16].copy_from_slice(&(dispatch_list.as_ptr() as u64).to_le_bytes());
+                let mut companion: *mut c_void = std::ptr::null_mut();
+                let hr2 = real::dev_create_command_signature(this, dpc.as_ptr() as usize, 0, riid, &mut companion);
+                if hr2 >= 0 && !companion.is_null() {
+                    dm_sig = Some((companion as usize, byte_stride, offset));
+                }
+            }
+        }
+        super::bind::note_dispatch_mesh_signature(sig, dm_sig);
+        super::bind::note_signature_dispatches(sig, list.iter().any(|a| a[0] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32));
+        let stride = u32::from_le_bytes(pc[0..4].try_into().unwrap());
+        let dispatch_only = list.len() == 1 && list[0][0] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32 && stride >= 12 && stride % 4 == 0;
+        super::bind::note_dispatch_only_signature(sig, dispatch_only.then_some(stride));
     }
     hr
 }
@@ -1266,6 +1432,15 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn console_indirect_argument_types_become_pc_ones() {
+        assert_eq!(pc_argument_type(105), D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32);
+        assert_eq!(pc_argument_type(107), D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH.0 as u32);
+        for t in 0..=10 {
+            assert_eq!(pc_argument_type(t), t, "PC type {t} stays");
+        }
+    }
 
     #[test]
     fn console_types_and_descs_become_pc_ones() {
@@ -1720,6 +1895,52 @@ mod tests {
         assert_eq!((dev.calls, dev.last_flags & 4, total), (2, 0, 65536));
         if let Some(m) = UAV_FORMAT_SUPPORT.lock().unwrap().as_mut() {
             m.remove(&((luid.LowPart, luid.HighPart), 24));
+        }
+    }
+
+    #[test]
+    fn update_page_mappings_x_maps_unmaps_and_validates() {
+        #[repr(C)]
+        struct PageRange {
+            op: u32,
+            pool_idx: u32,
+            count: u32,
+        }
+        #[repr(C)]
+        struct Mapping {
+            dest_va: u64,
+            num_ranges: u32,
+            _pad: u32,
+            ranges: *const PageRange,
+        }
+        unsafe {
+            let pool_base = 0x5_0000_0000u64;
+            let mut pool_idx = u32::MAX;
+            assert_eq!(register_page_pool_x(std::ptr::null_mut(), pool_base, 16, &mut pool_idx), S_OK);
+            assert_eq!(update_page_mappings_x(std::ptr::null_mut(), 0, std::ptr::null(), pool_base, 16, 0), S_OK);
+            assert_eq!(update_page_mappings_x(std::ptr::null_mut(), 1, std::ptr::null(), pool_base, 16, 0), E_INVALIDARG);
+
+            let ranges = [
+                PageRange { op: 1, pool_idx: 3, count: 2 },
+                PageRange { op: 0, pool_idx: 0, count: 1 },
+                PageRange { op: 1, pool_idx: 8, count: 1 },
+            ];
+            let dest_base = 0x6_0000_0000u64;
+            let map = Mapping { dest_va: dest_base, num_ranges: ranges.len() as u32, _pad: 0, ranges: ranges.as_ptr() };
+            assert_eq!(update_page_mappings_x(std::ptr::null_mut(), 1, &map as *const _ as *const u8, pool_base, 16, 0), S_OK);
+
+            let unmap = [PageRange { op: 2, pool_idx: 0, count: 1 }];
+            let unmap_entry = Mapping { dest_va: dest_base + PAGE_64K, num_ranges: 1, _pad: 0, ranges: unmap.as_ptr() };
+            assert_eq!(update_page_mappings_x(std::ptr::null_mut(), 1, &unmap_entry as *const _ as *const u8, pool_base, 16, 0), S_OK);
+
+            let bad_dest = Mapping { dest_va: dest_base + 0x100, num_ranges: 1, _pad: 0, ranges: ranges.as_ptr() };
+            assert_eq!(update_page_mappings_x(std::ptr::null_mut(), 1, &bad_dest as *const _ as *const u8, pool_base, 16, 0), E_INVALIDARG);
+            assert_eq!(update_page_mappings_x(std::ptr::null_mut(), 1, &map as *const _ as *const u8, 0, 16, 0), E_INVALIDARG);
+            let oob_range = [PageRange { op: 1, pool_idx: 15, count: 2 }];
+            let oob = Mapping { dest_va: dest_base, num_ranges: 1, _pad: 0, ranges: oob_range.as_ptr() };
+            assert_eq!(update_page_mappings_x(std::ptr::null_mut(), 1, &oob as *const _ as *const u8, pool_base, 16, 0), E_INVALIDARG);
+
+            assert_eq!(unregister_page_pool_x(std::ptr::null_mut(), pool_idx as u64), S_OK);
         }
     }
 }

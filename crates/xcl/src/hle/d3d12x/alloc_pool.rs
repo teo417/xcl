@@ -116,6 +116,28 @@ pub fn reset_list(list: usize, alloc: usize, ty: i32, reset: impl FnOnce(usize) 
     hr
 }
 
+/// The PC allocator `list` records on, also for a list this module has not seen: XCL's own (a
+/// mid-list split's next list, made on `current(alloc)`) records on the PC allocator the title's
+/// `alloc` stands for. Such a list is taken on there, so that its submits mark that allocator and
+/// it stays busy until the list is reset elsewhere or released. Off: `alloc`. 0: none.
+pub(super) fn recording_backing_or_take_on(list: usize, alloc: usize, ty: i32) -> usize {
+    if !enabled() {
+        return alloc;
+    }
+    let mut g = STATE.lock().unwrap();
+    let s = g.get_or_insert_with(State::default);
+    if let Some(&b) = s.of_list.get(&list) {
+        return b;
+    }
+    if alloc == 0 {
+        return 0;
+    }
+    let b = s.cur.get(&alloc).copied().unwrap_or(alloc);
+    s.types.entry(alloc).or_insert(ty);
+    move_list(s, list, b);
+    b
+}
+
 #[cfg(test)]
 pub(super) use recording_backing as recording_backing_for_test;
 
@@ -227,6 +249,34 @@ pub(super) unsafe fn allocator_in_flight(alloc: usize) -> bool {
     busy
 }
 
+/// Of chain recordings held under PC allocators (`(allocator, recordings)`), how many are under
+/// one put aside that a list still records on, that the GPU has not finished, that is free; under
+/// one a title's allocator stands for now that is busy, that is free; under one the pool does not
+/// know (the split-program counter line, `dispatch_chain::log_counts`).
+pub(super) fn holds(keys: &[(usize, usize)]) -> [usize; 6] {
+    let mut k = [0; 6];
+    let g = STATE.lock().unwrap();
+    let Some(s) = g.as_ref() else {
+        k[5] = keys.iter().map(|&(_, n)| n).sum();
+        return k;
+    };
+    let aside: HashSet<usize> = s.aside.values().flatten().copied().collect();
+    let in_use: HashSet<usize> = s.cur.values().copied().chain(s.types.keys().filter(|a| !s.cur.contains_key(a)).copied()).collect();
+    for &(b, n) in keys {
+        let backing = s.backings.get(&b);
+        let free = backing.is_none_or(|x| unsafe { x.free() });
+        let i = if aside.contains(&b) {
+            if backing.is_some_and(|x| !x.users.is_empty()) { 0 } else if !free { 1 } else { 2 }
+        } else if in_use.contains(&b) {
+            if free { 4 } else { 3 }
+        } else {
+            5
+        };
+        k[i] += n;
+    }
+    k
+}
+
 /// The title's allocator `alloc` is gone (its last Release): nothing of it stays here – a later
 /// allocator may get its address, and must not go on with this one's PC allocators. The ones
 /// made here go with it (those lists still record on are left alone: not freed, not tracked).
@@ -267,7 +317,22 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
     }
     let mut g = STATE.lock().unwrap();
     let s = g.get_or_insert_with(State::default);
-    title_reset_in(s, alloc, |raw| super::real::reset_pc_allocator(raw))
+    let hr = title_reset_in(s, alloc, |raw| super::real::reset_pc_allocator(raw));
+    let free = free_aside(s);
+    drop(g);
+    for b in free {
+        super::real::dispatch_chain::allocator_reset(b);
+    }
+    hr
+}
+
+/// The PC allocators put aside that nothing holds any more: their lists have moved on and the GPU
+/// is done with what they submitted. Their own Reset waits until the title's allocator they stood
+/// for takes one of them again, which may not come, so the scratch and commands that chained
+/// ExecuteIndirects kept with their recordings (`dispatch_chain::allocator_reset`) go now. Without
+/// this a title held 1,887 recordings under 48 allocators 110 s in, and memory grew until removal.
+unsafe fn free_aside(s: &State) -> Vec<usize> {
+    s.aside.values().flatten().copied().filter(|b| s.backings.get(b).is_none_or(|x| x.free())).collect()
 }
 
 /// The allocator transition, with the PC Reset supplied so failure/retry needs no GPU in tests.
@@ -368,6 +433,205 @@ mod tests {
         assert_eq!(s.aside.get(&alloc), Some(&vec![alloc]), "only the successful reset switches backings");
         assert_eq!(s.of_list.get(&list), Some(&alloc), "the earlier recording stays on its original backing");
         assert_eq!((s.made, s.swaps), (0, 1));
+    }
+
+    /// A list the pool has not seen (XCL's own, made on the PC allocator the title's allocator
+    /// stands for) is taken on there by a chained ExecuteIndirect: that allocator is busy with it.
+    #[test]
+    fn a_list_the_pool_has_not_seen_is_taken_on_with_the_pc_allocator_it_records_on() {
+        let mut ids = Box::new([0u8; 4]);
+        let base = ids.as_mut_ptr() as usize;
+        let (title, backing, list, other) = (base, base + 1, base + 2, base + 3);
+        let ty = D3D12_COMMAND_LIST_TYPE_DIRECT.0;
+        STATE.lock().unwrap().get_or_insert_with(State::default).cur.insert(title, backing);
+        let taken = recording_backing_or_take_on(list, title, ty);
+        let again = recording_backing_or_take_on(list, other, ty);
+        let (busy, typed) = {
+            let g = STATE.lock().unwrap();
+            let s = g.as_ref().unwrap();
+            (s.backings.get(&backing).is_some_and(|b| b.users.contains(&list) && !unsafe { b.free() }), s.types.get(&title) == Some(&ty))
+        };
+        let none = recording_backing_or_take_on(other, 0, ty);
+        forget_list(list);
+        {
+            let mut g = STATE.lock().unwrap();
+            let s = g.as_mut().unwrap();
+            s.cur.remove(&title);
+            s.types.remove(&title);
+            s.backings.remove(&backing);
+        }
+        assert_eq!(taken, backing, "filed with the PC allocator the list records on, not the title's");
+        assert_eq!(again, backing, "a list taken on keeps its backing");
+        assert!(busy, "the backing is busy while the list records on it");
+        assert!(typed, "the title's allocator can be swapped while the list holds its backing");
+        assert_eq!(none, 0);
+    }
+
+    /// A PC allocator put aside lets go of what chains kept with its recordings once nothing holds
+    /// it, at the next title Reset of any allocator; one a list still records on keeps them.
+    #[test]
+    fn a_free_allocator_put_aside_lets_go_of_its_chain_recordings_at_the_next_title_reset() {
+        use super::super::real::dispatch_chain::{holds_recordings_for_test as holds, note_recordings_for_test as note};
+        let mut ids = Box::new([0u8; 5]);
+        let base = ids.as_mut_ptr() as usize;
+        let (title, aside, busy, list, other) = (base, base + 1, base + 2, base + 3, base + 4);
+        {
+            let mut g = STATE.lock().unwrap();
+            let s = g.get_or_insert_with(State::default);
+            s.aside.insert(title, vec![aside, busy]);
+            s.backings.insert(aside, Backing::default());
+            s.backings.entry(busy).or_default().users.insert(list);
+        }
+        note(aside);
+        note(busy);
+        // another title allocator that holds nothing: reset as it is
+        let hr = unsafe { title_reset(other as *mut c_void) };
+        let (freed, kept) = (!holds(aside), holds(busy));
+        {
+            let mut g = STATE.lock().unwrap();
+            let s = g.as_mut().unwrap();
+            s.aside.remove(&title);
+            s.backings.remove(&aside);
+            s.backings.remove(&busy);
+        }
+        super::super::real::dispatch_chain::allocator_reset(aside);
+        super::super::real::dispatch_chain::allocator_reset(busy);
+        assert_eq!(hr, None);
+        assert!(freed, "a free allocator put aside still held its chain recordings");
+        assert!(kept, "an allocator a list still records on lost its chain recordings");
+    }
+
+    /// A list the pool had not seen, taken on by a chained ExecuteIndirect, and its allocator put
+    /// aside: the recording stays while the list records there, then while its submit runs, and
+    /// goes once the list is reset elsewhere and that submit is done.
+    #[test]
+    fn a_taken_on_lists_chain_recording_stays_until_it_moves_on_and_its_submit_is_done() {
+        use super::super::real::dispatch_chain::{holds_recordings_for_test as holds, note_recordings_for_test as note};
+        use std::cell::Cell;
+        use std::mem::{offset_of, size_of};
+
+        #[repr(C)]
+        struct Fence {
+            vtable: *const usize,
+            value: Cell<u64>,
+        }
+        unsafe extern "system" fn completed(this: *mut c_void) -> u64 {
+            (*this.cast::<Fence>()).value.get()
+        }
+        unsafe extern "system" fn release(_: *mut c_void) -> u32 {
+            0
+        }
+        extern "system" fn unexpected_call() { std::process::abort(); }
+
+        const SLOT: usize = size_of::<usize>();
+        let mut vtable = [unexpected_call as usize; size_of::<ID3D12Fence_Vtbl>() / SLOT];
+        vtable[offset_of!(ID3D12Fence_Vtbl, GetCompletedValue) / SLOT] = completed as usize;
+        vtable[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.Release) / SLOT] = release as usize;
+        let mut fence = Fence { vtable: vtable.as_ptr(), value: Cell::new(0) };
+        let mut ids = Box::new([0u8; 6]);
+        let base = ids.as_mut_ptr() as usize;
+        let (title, backing, next, list, elsewhere, trigger) = (base, base + 1, base + 2, base + 3, base + 4, base + 5);
+        let ty = D3D12_COMMAND_LIST_TYPE_DIRECT.0;
+        STATE.lock().unwrap().get_or_insert_with(State::default).cur.insert(title, backing);
+        let taken = recording_backing_or_take_on(list, title, ty);
+        note(taken);
+        {
+            // its submit, and the title's Reset that put its allocator aside
+            let mut g = STATE.lock().unwrap();
+            let s = g.as_mut().unwrap();
+            let f = unsafe { ID3D12Fence::from_raw(std::ptr::from_mut(&mut fence).cast()) };
+            s.backings.get_mut(&backing).unwrap().marks.insert(1, (f, 7));
+            s.cur.insert(title, next);
+            s.aside.insert(title, vec![backing]);
+        }
+        let sweep = || unsafe { title_reset(trigger as *mut c_void) };
+        sweep();
+        let while_recording = holds(backing);
+        assert_eq!(reset_list(list, elsewhere, ty, |_| 0), 0);
+        sweep();
+        let while_on_gpu = holds(backing);
+        fence.value.set(7);
+        sweep();
+        let after = holds(backing);
+        forget_list(list);
+        {
+            let mut g = STATE.lock().unwrap();
+            let s = g.as_mut().unwrap();
+            s.cur.remove(&title);
+            s.aside.remove(&title);
+            s.types.remove(&title);
+            s.types.remove(&elsewhere);
+            s.backings.remove(&backing);
+            s.backings.remove(&elsewhere);
+        }
+        super::super::real::dispatch_chain::allocator_reset(backing);
+        assert_eq!(taken, backing);
+        assert!(while_recording, "the recording went while the list still recorded on its allocator");
+        assert!(while_on_gpu, "the recording went while its submit was on the GPU");
+        assert!(!after, "the recording stayed after the list moved on and its submit was done");
+    }
+
+    /// The counter line's split of the chain recordings held: by what holds the PC allocator
+    /// they are under.
+    #[test]
+    fn the_recordings_held_are_split_by_what_holds_their_allocator() {
+        let mut ids = Box::new([0u8; 8]);
+        let base = ids.as_mut_ptr() as usize;
+        let (title, used, free, busy, idle, other, list, list2) = (base, base + 1, base + 2, base + 3, base + 4, base + 5, base + 6, base + 7);
+        {
+            let mut g = STATE.lock().unwrap();
+            let s = g.get_or_insert_with(State::default);
+            s.aside.insert(title, vec![used, free]);
+            s.cur.insert(title, busy);
+            s.types.insert(idle, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+            s.backings.entry(used).or_default().users.insert(list);
+            s.backings.entry(busy).or_default().users.insert(list2);
+        }
+        let k = holds(&[(used, 1), (free, 2), (busy, 3), (idle, 4), (other, 5)]);
+        {
+            let mut g = STATE.lock().unwrap();
+            let s = g.as_mut().unwrap();
+            s.aside.remove(&title);
+            s.cur.remove(&title);
+            s.types.remove(&idle);
+            s.backings.remove(&used);
+            s.backings.remove(&busy);
+        }
+        assert_eq!(k, [1, 0, 2, 3, 4, 5]);
+    }
+
+    /// The case #2333's lines leave open: a list the pool had not seen, whose title's allocator
+    /// was put aside and is free. Its recording is not with that allocator, so it does not go with it.
+    #[test]
+    fn a_free_title_allocator_put_aside_does_not_take_a_live_lists_chain_recording_with_it() {
+        use super::super::real::dispatch_chain::{holds_recordings_for_test as holds, note_recordings_for_test as note};
+        let mut ids = Box::new([0u8; 4]);
+        let base = ids.as_mut_ptr() as usize;
+        let (title, backing, list, trigger) = (base, base + 1, base + 2, base + 3);
+        let ty = D3D12_COMMAND_LIST_TYPE_DIRECT.0;
+        {
+            // the title's Reset put its own allocator aside (free now) for `backing`
+            let mut g = STATE.lock().unwrap();
+            let s = g.get_or_insert_with(State::default);
+            s.cur.insert(title, backing);
+            s.aside.insert(title, vec![title]);
+        }
+        let taken = recording_backing_or_take_on(list, title, ty);
+        note(taken);
+        unsafe { title_reset(trigger as *mut c_void) };
+        let kept = holds(taken);
+        forget_list(list);
+        {
+            let mut g = STATE.lock().unwrap();
+            let s = g.as_mut().unwrap();
+            s.cur.remove(&title);
+            s.aside.remove(&title);
+            s.types.remove(&title);
+            s.backings.remove(&backing);
+        }
+        super::super::real::dispatch_chain::allocator_reset(taken);
+        assert_ne!(taken, title, "filed with the title's allocator, which the sweep frees");
+        assert!(kept, "a live list's chain recording went with a free allocator put aside");
     }
 
     /// Final-release cleanup drops only the recording's hold: another live list and a pending

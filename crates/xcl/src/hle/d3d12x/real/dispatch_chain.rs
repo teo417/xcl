@@ -363,6 +363,16 @@ pub(in crate::hle::d3d12x) fn allocator_reset(allocator: usize) {
     }
 }
 
+#[cfg(test)]
+pub(in crate::hle::d3d12x) fn note_recordings_for_test(allocator: usize) {
+    RECORDINGS.lock().unwrap().entry(allocator).or_default();
+}
+
+#[cfg(test)]
+pub(in crate::hle::d3d12x) fn holds_recordings_for_test(allocator: usize) -> bool {
+    RECORDINGS.lock().unwrap().contains_key(&allocator)
+}
+
 unsafe fn scratch_buffer(dev: &ID3D12Device, bytes: u64) -> Option<ID3D12Resource> {
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: bytes, Height: 1, DepthOrArraySize: 1, MipLevels: 1,

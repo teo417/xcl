@@ -1691,6 +1691,52 @@ fn wait_chain(waits: &[ChainWait], signals: &[(usize, u64)], start: usize) -> (V
     }
 }
 
+/// Calls of one queue the state lines show.
+const QUEUE_STATE_CALLS: usize = 6;
+
+/// One line per queue with tracked calls the GPU has not completed: the earliest of them in
+/// submission order (`q1: #7 wait cell 0x…>=0x2 (done 0x1) | #8 signal …`). A chain line names only
+/// where one wait ends; this shows what every queue is held at.
+unsafe fn queue_state(graph: &SyncGraph) -> Vec<String> {
+    let mut calls: Vec<(usize, u64, String)> = Vec::new();
+    for (&va, cell) in &graph.cells {
+        if cell.armed_waits.is_empty() && cell.submitted_signals.is_empty() {
+            continue;
+        }
+        let done = cell.fence.as_ref().map_or(0, |f| f.GetCompletedValue());
+        for aw in cell.armed_waits.iter().filter(|aw| aw.val > done) {
+            let age = aw.armed_at.elapsed().as_millis();
+            calls.push((queue_id(aw.waiting_queue), aw.wait_seq, format!("wait cell {va:#x}>={:#x} (done {done:#x}, {age} ms)", aw.val)));
+        }
+        for s in cell.submitted_signals.iter().filter(|s| s.val > done) {
+            calls.push((queue_id(s.queue), s.seq, format!("signal cell {va:#x}={:#x} (done {done:#x})", s.val)));
+        }
+    }
+    for (&raw, tf) in &graph.title_fences {
+        if tf.waits.is_empty() && tf.signals.is_empty() {
+            continue;
+        }
+        let p = raw as *mut c_void;
+        let done = ID3D12Fence::from_raw_borrowed(&p).map_or(0, |f| f.GetCompletedValue());
+        for &(val, queue, seq) in tf.waits.iter().filter(|w| w.0 > done) {
+            calls.push((queue_id(queue), seq, format!("wait fence {raw:#x}>={val:#x} (done {done:#x})")));
+        }
+        for s in tf.signals.iter().filter(|s| s.val > done) {
+            calls.push((queue_id(s.queue), s.seq, format!("signal fence {raw:#x}={:#x} (done {done:#x})", s.val)));
+        }
+    }
+    calls.sort_by_key(|c| (c.0, c.1));
+    calls
+        .chunk_by(|a, b| a.0 == b.0)
+        .map(|q| {
+            let shown: Vec<String> = q.iter().take(QUEUE_STATE_CALLS).map(|c| format!("#{} {}", c.1, c.2)).collect();
+            let more = q.len().saturating_sub(QUEUE_STATE_CALLS);
+            let more = if more > 0 { format!(" (+{more} more)") } else { String::new() };
+            format!("q{}: {}{more}", q[0].0, shown.join(" | "))
+        })
+        .collect()
+}
+
 /// The chain from the first of `waiters`, and how many of those cells end the same way at the same queue.
 fn wait_chain_line(waits: &[ChainWait], signals: &[(usize, u64)], waiters: &[usize]) -> Option<String> {
     let (hops, end_q, end) = wait_chain(waits, signals, *waiters.first()?);
@@ -1738,7 +1784,7 @@ fn wake_sync_watchdog() {
                         && WAIT_CHAIN_LINES.load(Ordering::Relaxed) < MAX_WAIT_CHAIN_LINES
                         && wait_chain_due(graph, now, &WAIT_CHAIN_LOGGED)
                     {
-                        in_flight = Some(unsafe { calls_in_flight(graph) });
+                        in_flight = Some(unsafe { (calls_in_flight(graph), queue_state(graph)) });
                     }
                     for (&va, cell) in graph.cells.iter_mut() {
                         if cell.armed_waits.is_empty() && cell.cpu_signaled_max == 0 {
@@ -1820,7 +1866,7 @@ fn wake_sync_watchdog() {
                 );
             }
             if had_expired {
-                if let Some((waits, signals)) = in_flight {
+                if let Some(((waits, signals), state)) = in_flight {
                     if WAIT_CHAIN_LINES.load(Ordering::Relaxed) < MAX_WAIT_CHAIN_LINES {
                         if let Some(line) = wait_chain_line(&waits, &signals, &waiters) {
                             *WAIT_CHAIN_LOGGED.lock().unwrap() = Some(Instant::now());
@@ -1831,6 +1877,9 @@ fn wake_sync_watchdog() {
                                 WRITE64_CYCLE_BREAKS.load(Ordering::Relaxed),
                                 super::sparse::fence_status()
                             );
+                            for q in &state {
+                                crate::xlog_warn!("D3D12.X: GPU queue state: {q}");
+                            }
                         }
                     }
                 }
@@ -5010,6 +5059,12 @@ mod tests {
         g.cells.insert(0x1000, cell(vec![wait(qa, 1)], vec![(qb, 2)], 7));
         g.cells.insert(0x2000, cell(vec![wait(qb, 1)], vec![(qa, 2)], 7));
         assert_eq!(ends(&g, qa), (vec![(qa, 0x1000), (qb, 0x2000)], qa, ChainEnd::Cycle));
+        // one state line per queue, its calls in submission order
+        let state = unsafe { queue_state(&g) };
+        let of = |q: usize| state.iter().find(|l| l.starts_with(&format!("q{}: ", queue_id(q)))).unwrap();
+        assert_eq!(state.len(), 2, "{state:?}");
+        let a = of(qa);
+        assert!(a.contains("#1 wait cell 0x1000>=0x7 (done 0x0, ") && a.contains("| #2 signal cell 0x2000=0x7 (done 0x0)"), "{a}");
         let cycle = line(&g, &[qa, qc]).unwrap();
         assert!(
             cycle.contains(" Wait64(0x2000>=0x7) -> q") && cycle.contains(" end=cycle (") && cycle.ends_with("; same_end=1/2 (expired cells this tick)"),

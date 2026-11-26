@@ -68,7 +68,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     K32GetProcessMemoryInfo(windows_sys::Win32::System::Threading::GetCurrentProcess(), &mut c as *mut _ as *mut _, c.cb);
                     c.PrivateUsage
                 };
-                let (local, non_local) = crate::hle::d3d12x::real::video_memory().unwrap_or((0, 0));
+                let (local, non_local, budget) = crate::hle::d3d12x::real::video_memory().unwrap_or((0, 0, 0));
                 let (arenas, arenas_made) = crate::hle::d3d12x::vram::arena_bytes();
                 let (pools, pools_mapped) = crate::hle::d3d12x::sparse::pool_bytes();
                 let (pages, page_pools) = crate::hle::d3d12x::vram::page_bytes();
@@ -87,12 +87,14 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 );
                 let vl = crate::hle::d3d12x::real::vram_live_bytes();
                 crate::xlog_info!(
-                    "vram-live: title_heaps (local {} MB, nonlocal {} MB), committed (local {} MB, nonlocal {} MB)",
+                    "vram-live: budget {} MB local; title_heaps (local {} MB, nonlocal {} MB), committed (local {} MB, nonlocal {} MB)",
+                    mb(budget),
                     mb(vl[0]),
                     mb(vl[1]),
                     mb(vl[2]),
                     mb(vl[3])
                 );
+                crate::xlog_info!("vram-committed-top: {}", crate::hle::d3d12x::real::committed_top(8));
                 let va = crate::hle::d3d12x::real::vram_alloc_bytes();
                 crate::xlog_info!(
                     "vram-allocs (cumulative): title heaps {} MB, placed-own {} MB; chain scratch {} MB, cmd_pool {} MB (allocs {} in {} ms, reuses {})",

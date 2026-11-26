@@ -423,8 +423,9 @@ pub fn device_raw() -> *mut c_void {
     DEVICE.load(Ordering::Acquire) as *mut c_void
 }
 
-/// The process's video memory on the device's adapter: (local, non-local) bytes in use.
-pub fn video_memory() -> Option<(u64, u64)> {
+/// The process's video memory on the device's adapter: (local, non-local) bytes in use, and the
+/// local bytes the system lets it use now (its budget).
+pub fn video_memory() -> Option<(u64, u64, u64)> {
     use windows::Win32::Graphics::Dxgi::*;
     let raw = device_raw();
     let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }?;
@@ -436,7 +437,7 @@ pub fn video_memory() -> Option<(u64, u64)> {
         let mut non_local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
         adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local).ok()?;
         adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut non_local).ok()?;
-        Some((local.CurrentUsage, non_local.CurrentUsage))
+        Some((local.CurrentUsage, non_local.CurrentUsage, local.Budget))
     }
 }
 
@@ -444,15 +445,54 @@ static VRAM_TITLE_HEAPS: AtomicU64 = AtomicU64::new(0);
 static VRAM_PLACED_OWN: AtomicU64 = AtomicU64::new(0);
 /// Live byte counters: [0]=title_heap_local, [1]=title_heap_nonlocal, [2]=committed_local, [3]=committed_nonlocal
 static VRAM_LIVE_BUCKETS: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
-static VRAM_LIVE_MAP: Mutex<Option<HashMap<usize, (usize, u64)>>> = Mutex::new(None);
+static VRAM_LIVE_MAP: Mutex<Option<HashMap<usize, (usize, u64, CommittedShape)>>> = Mutex::new(None);
 
-fn note_vram_live(ptr: usize, bucket: usize, bytes: u64) {
+/// What a committed resource is, to group the live ones: (dimension, format, width, height,
+/// flags). A buffer's width is its size rounded up to a power of two; heaps are all zero.
+type CommittedShape = (i32, i32, u64, u32, i32);
+
+fn committed_shape(d: &D3D12_RESOURCE_DESC) -> CommittedShape {
+    let buffer = d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
+    let width = if buffer { d.Width.checked_next_power_of_two().unwrap_or(d.Width) } else { d.Width };
+    (d.Dimension.0, d.Format.0, width, d.Height, d.Flags.0)
+}
+
+/// The `n` shapes with the most live bytes in local video memory: (shape, resources, bytes).
+fn committed_groups(n: usize) -> Vec<(CommittedShape, u32, u64)> {
+    let mut groups: HashMap<CommittedShape, (u32, u64)> = HashMap::new();
+    for &(bucket, bytes, shape) in VRAM_LIVE_MAP.lock().unwrap().iter().flat_map(|m| m.values()) {
+        if bucket == 2 {
+            let g = groups.entry(shape).or_default();
+            g.0 += 1;
+            g.1 += bytes;
+        }
+    }
+    let mut v: Vec<_> = groups.into_iter().map(|(s, (c, b))| (s, c, b)).collect();
+    v.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+    v.truncate(n);
+    v
+}
+
+/// `committed_groups` as one log line.
+pub fn committed_top(n: usize) -> String {
+    let one = |((dim, format, width, height, flags), count, bytes): (CommittedShape, u32, u64)| {
+        let what = if dim == D3D12_RESOURCE_DIMENSION_BUFFER.0 {
+            format!("buffer <={} KB", width >> 10)
+        } else {
+            format!("tex{}d format {format} {width}x{height}", dim - 1)
+        };
+        format!("{what} flags {flags:#x}: {count} = {} MB", bytes >> 20)
+    };
+    committed_groups(n).into_iter().map(one).collect::<Vec<_>>().join("; ")
+}
+
+fn note_vram_live(ptr: usize, bucket: usize, bytes: u64, shape: CommittedShape) {
     if ptr == 0 || bytes == 0 || bucket >= VRAM_LIVE_BUCKETS.len() {
         return;
     }
     let mut g = VRAM_LIVE_MAP.lock().unwrap();
     let map = g.get_or_insert_with(HashMap::new);
-    if let Some((old_b, old_bytes)) = map.insert(ptr, (bucket, bytes)) {
+    if let Some((old_b, old_bytes, _)) = map.insert(ptr, (bucket, bytes, shape)) {
         VRAM_LIVE_BUCKETS[old_b].fetch_sub(old_bytes, Ordering::Relaxed);
     }
     VRAM_LIVE_BUCKETS[bucket].fetch_add(bytes, Ordering::Relaxed);
@@ -463,7 +503,7 @@ fn forget_vram_live(ptr: usize) {
         return;
     }
     let gone = VRAM_LIVE_MAP.lock().unwrap().as_mut().and_then(|m| m.remove(&ptr));
-    if let Some((bucket, bytes)) = gone {
+    if let Some((bucket, bytes, _)) = gone {
         VRAM_LIVE_BUCKETS[bucket].fetch_sub(bytes, Ordering::Relaxed);
     }
 }
@@ -3279,7 +3319,7 @@ unsafe fn note_committed_live(this: *mut c_void, heap_props: usize, desc: usize,
     };
     let is_local = hp.Type == D3D12_HEAP_TYPE_DEFAULT
         || (hp.Type == D3D12_HEAP_TYPE_CUSTOM && hp.MemoryPoolPreference == D3D12_MEMORY_POOL_L1);
-    note_vram_live(*ppv as usize, if is_local { 2 } else { 3 }, bytes);
+    note_vram_live(*ppv as usize, if is_local { 2 } else { 3 }, bytes, committed_shape(&rd));
 }
 
 pub(super) unsafe extern "system" fn dev_create_committed_resource(this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
@@ -3577,7 +3617,7 @@ unsafe fn note_heap_uma(desc: usize, ppv: *mut *mut c_void) {
         VRAM_TITLE_HEAPS.fetch_add(d.SizeInBytes, Ordering::Relaxed);
         let is_local = d.Properties.Type == D3D12_HEAP_TYPE_DEFAULT
             || (d.Properties.Type == D3D12_HEAP_TYPE_CUSTOM && d.Properties.MemoryPoolPreference == D3D12_MEMORY_POOL_L1);
-        note_vram_live(*ppv as usize, if is_local { 0 } else { 1 }, d.SizeInBytes);
+        note_vram_live(*ppv as usize, if is_local { 0 } else { 1 }, d.SizeInBytes, Default::default());
     }
     if d.Flags.0 & DENY_BUFFERS != 0 || d.SizeInBytes == 0 || UMA_BUFFER.lock().unwrap().is_empty() {
         return;
@@ -9286,13 +9326,17 @@ void main() {
 mod vram_live_tests {
     use super::*;
 
+    /// the counters are the process's: one test at a time
+    static COUNTERS: Mutex<()> = Mutex::new(());
+
     #[test]
     fn vram_live_tracks_and_decrements_on_forget() {
+        let _one = COUNTERS.lock().unwrap_or_else(|e| e.into_inner());
         let before = vram_live_bytes();
         let ptr_heap = 0xCAFE_0001usize;
         let ptr_comm = 0xCAFE_0002usize;
-        note_vram_live(ptr_heap, 0, 4 << 20);
-        note_vram_live(ptr_comm, 2, 8 << 20);
+        note_vram_live(ptr_heap, 0, 4 << 20, Default::default());
+        note_vram_live(ptr_comm, 2, 8 << 20, Default::default());
         let mid = vram_live_bytes();
         assert_eq!(mid[0] - before[0], 4 << 20);
         assert_eq!(mid[2] - before[2], 8 << 20);
@@ -9301,6 +9345,24 @@ mod vram_live_tests {
         let after = vram_live_bytes();
         assert_eq!(after[0], before[0]);
         assert_eq!(after[2], before[2]);
+    }
+
+    #[test]
+    fn committed_resources_are_grouped_by_shape() {
+        let _one = COUNTERS.lock().unwrap_or_else(|e| e.into_inner());
+        let buffer = |width| D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: width, Height: 1, ..Default::default() };
+        // two buffers of one size class, and a texture; far larger than other tests make
+        let a = committed_shape(&buffer((1 << 40) - 8));
+        assert_eq!(a, committed_shape(&buffer(1 << 40)));
+        let t = committed_shape(&D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 3840, Height: 2160, ..Default::default() });
+        note_vram_live(0xCAFE_0011, 2, 1 << 40, a);
+        note_vram_live(0xCAFE_0012, 2, 1 << 40, a);
+        note_vram_live(0xCAFE_0013, 2, 1 << 39, t);
+        assert_eq!(committed_groups(2), vec![(a, 2, 2 << 40), (t, 1, 1 << 39)]);
+        assert!(committed_top(2).contains("tex2d format 0 3840x2160"));
+        for p in [0xCAFE_0011, 0xCAFE_0012, 0xCAFE_0013] {
+            forget_vram_live(p);
+        }
     }
 }
 

@@ -1,32 +1,37 @@
-//! `XCL_GPU_TIMING=1`: per-submission GPU timestamp queries for DIRECT and COMPUTE queues.
+//! `XCL_GPU_TIMING=1`: per-submission GPU timestamp queries for DIRECT queues. COMPUTE queues
+//! are left alone: with them timed too, a title stopped submitting as soon as they started to wait
+//! for its direct queue (RTX 4080 SUPER, two runs of two).
 
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
 
-const SLOTS: usize = 32;
+const SLOTS: usize = 256;
 
 static SUBMISSIONS: AtomicU64 = AtomicU64::new(0);
 static LISTS_TIMED: AtomicU64 = AtomicU64::new(0);
 static GPU_TIME_US: AtomicU64 = AtomicU64::new(0);
 static MAX_SUBMIT_US: AtomicU64 = AtomicU64::new(0);
+static UNTIMED: AtomicU64 = AtomicU64::new(0);
 
 pub fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("XCL_GPU_TIMING").is_ok_and(|v| v.trim() == "1"))
 }
 
-/// `[submissions, lists_timed, gpu_time_us, max_submit_us]`
-pub fn activity() -> [u64; 4] {
+/// `[submissions, lists_timed, gpu_time_us, max_submit_us, untimed_submissions]`; `gpu_time_us`
+/// sums the direct queues, which may overlap on the GPU.
+pub fn activity() -> [u64; 5] {
     [
         SUBMISSIONS.load(Ordering::Relaxed),
         LISTS_TIMED.load(Ordering::Relaxed),
         GPU_TIME_US.load(Ordering::Relaxed),
         MAX_SUBMIT_US.load(Ordering::Relaxed),
+        UNTIMED.load(Ordering::Relaxed),
     ]
 }
 
@@ -55,12 +60,16 @@ struct QueueTimer {
     slots: Vec<Slot>,
 }
 
-static TIMERS: Mutex<Option<HashMap<usize, QueueTimer>>> = Mutex::new(None);
+/// one lock per queue: a submission the driver blocks (behind a queue wait) must not stop the
+/// other queues, which may be the ones to signal it
+type Timers = HashMap<usize, Arc<Mutex<QueueTimer>>>;
+
+static TIMERS: Mutex<Option<Timers>> = Mutex::new(None);
 
 impl QueueTimer {
     unsafe fn new(queue: &ID3D12CommandQueue) -> Option<Self> {
         let desc = queue.GetDesc();
-        if desc.Type != D3D12_COMMAND_LIST_TYPE_DIRECT && desc.Type != D3D12_COMMAND_LIST_TYPE_COMPUTE {
+        if desc.Type != D3D12_COMMAND_LIST_TYPE_DIRECT {
             return None;
         }
         let freq = queue.GetTimestampFrequency().ok()?;
@@ -135,6 +144,28 @@ impl QueueTimer {
         })
     }
 
+    /// Record the two timestamp lists of a free slot: `(start, end, fence, value)`.
+    unsafe fn prepare(&mut self, lists: usize) -> Option<(*mut c_void, *mut c_void, ID3D12Fence, u64)> {
+        self.drain();
+        let idx = self.slots.iter().position(|s| !s.in_flight)?;
+        let q0 = (idx * 2) as u32;
+        let val = self.next_val;
+        let slot = &mut self.slots[idx];
+        slot.alloc.Reset().ok()?;
+        slot.start.Reset(&slot.alloc, None).ok()?;
+        slot.start.EndQuery(&self.heap, D3D12_QUERY_TYPE_TIMESTAMP, q0);
+        slot.start.Close().ok()?;
+        slot.end.Reset(&slot.alloc, None).ok()?;
+        slot.end.EndQuery(&self.heap, D3D12_QUERY_TYPE_TIMESTAMP, q0 + 1);
+        slot.end.ResolveQueryData(&self.heap, D3D12_QUERY_TYPE_TIMESTAMP, q0, 2, &self.readback, (idx * 2 * 8) as u64);
+        slot.end.Close().ok()?;
+        slot.val = val;
+        slot.lists = lists;
+        slot.in_flight = true;
+        self.next_val += 1;
+        Some((slot.start.as_raw(), slot.end.as_raw(), self.fence.clone(), val))
+    }
+
     unsafe fn drain(&mut self) {
         let done = self.fence.GetCompletedValue();
         let any_ready = self.slots.iter().any(|s| s.in_flight && s.val <= done);
@@ -177,56 +208,28 @@ pub unsafe fn wrap_submit(queue_raw: *mut c_void, chunk: &[*mut c_void], submit:
         submit(chunk);
         return;
     };
-    let prepared = {
+    let timer = {
         let mut guard = TIMERS.lock().unwrap();
         let map = guard.get_or_insert_with(HashMap::new);
         if !map.contains_key(&(queue_raw as usize)) {
             if let Some(t) = QueueTimer::new(queue) {
-                map.insert(queue_raw as usize, t);
+                map.insert(queue_raw as usize, Arc::new(Mutex::new(t)));
             }
         }
-        if let Some(timer) = map.get_mut(&(queue_raw as usize)) {
-            timer.drain();
-            if let Some(idx) = timer.slots.iter().position(|s| !s.in_flight) {
-                let q0 = (idx * 2) as u32;
-                let q1 = q0 + 1;
-                let heap = timer.heap.clone();
-                let readback = timer.readback.clone();
-                let fence = timer.fence.clone();
-                let val = timer.next_val;
-                timer.next_val += 1;
-                let slot = &mut timer.slots[idx];
-                if slot.alloc.Reset().is_ok()
-                    && slot.start.Reset(&slot.alloc, None).is_ok()
-                {
-                    slot.start.EndQuery(&heap, D3D12_QUERY_TYPE_TIMESTAMP, q0);
-                    let ok_start = slot.start.Close().is_ok();
-                    let ok_end = ok_start && slot.end.Reset(&slot.alloc, None).is_ok();
-                    if ok_end {
-                        slot.end.EndQuery(&heap, D3D12_QUERY_TYPE_TIMESTAMP, q1);
-                        slot.end.ResolveQueryData(&heap, D3D12_QUERY_TYPE_TIMESTAMP, q0, 2, &readback, (idx * 2 * 8) as u64);
-                        if slot.end.Close().is_ok() {
-                            slot.val = val;
-                            slot.lists = chunk.len();
-                            slot.in_flight = true;
-                            Some((slot.start.as_raw(), slot.end.as_raw(), fence, val))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        }
+        map.get(&(queue_raw as usize)).cloned()
     };
+    let Some(timer) = timer else {
+        UNTIMED.fetch_add(1, Ordering::Relaxed);
+        submit(chunk);
+        return;
+    };
+    // held until the fence is signalled: two threads submitting to one queue must signal the
+    // values in order, or a slot is reused while the GPU still runs it
+    let mut timer = timer.lock().unwrap();
+    let prepared = timer.prepare(chunk.len());
     let Some((start_raw, end_raw, fence, val)) = prepared else {
+        drop(timer);
+        UNTIMED.fetch_add(1, Ordering::Relaxed);
         submit(chunk);
         return;
     };
@@ -236,6 +239,7 @@ pub unsafe fn wrap_submit(queue_raw: *mut c_void, chunk: &[*mut c_void], submit:
     wrapped.push(end_raw);
     submit(&wrapped);
     let _ = queue.Signal(&fence, val);
+    drop(timer);
 }
 
 #[cfg(test)]

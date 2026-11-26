@@ -647,24 +647,36 @@ pub fn init() -> Result<String, String> {
     }
 }
 
+/// Whether a debug layer message is logged: the first 8 of its id in each time window. `seen`
+/// is the id's (window, messages in it).
+fn debug_message_passes(seen: &mut (u64, u32), window: u64) -> bool {
+    if seen.0 != window {
+        *seen = (window, 0);
+    }
+    seen.1 = seen.1.saturating_add(1);
+    seen.1 <= 8
+}
+
 /// A debug layer message: errors and warnings into the log – the first 8 of each message id
-/// (3 000 in all). One cap for all of them (200) was used up in seconds by two per-frame state
-/// errors of a retail game, long before the message that came with its device removal.
+/// in every 10 s (20 000 in all), so a message that comes with a late hang still shows after a
+/// per-frame one of the same id. One cap for all of them (200) was used up in seconds by two
+/// per-frame state errors of a retail game, long before the message that came with its device
+/// removal.
 unsafe extern "system" fn debug_message(_category: D3D12_MESSAGE_CATEGORY, severity: D3D12_MESSAGE_SEVERITY, id: D3D12_MESSAGE_ID, text: windows::core::PCSTR, _context: *mut c_void) {
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    static PER_ID: Mutex<Option<HashMap<i32, u32>>> = Mutex::new(None);
+    static PER_ID: Mutex<Option<HashMap<i32, (u64, u32)>>> = Mutex::new(None);
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     if severity.0 > D3D12_MESSAGE_SEVERITY_WARNING.0 {
         return;
     }
     {
+        let window = START.get_or_init(std::time::Instant::now).elapsed().as_secs() / 10;
         let mut g = PER_ID.lock().unwrap();
-        let n = g.get_or_insert_with(HashMap::new).entry(id.0).or_insert(0);
-        *n += 1;
-        if *n > 8 {
+        if !debug_message_passes(g.get_or_insert_with(HashMap::new).entry(id.0).or_insert((window, 0)), window) {
             return;
         }
     }
-    if N.fetch_add(1, Ordering::Relaxed) >= 3000 {
+    if N.fetch_add(1, Ordering::Relaxed) >= 20_000 {
         return;
     }
     let t = if text.is_null() { String::new() } else { String::from_utf8_lossy(text.as_bytes()).into_owned() };
@@ -9549,6 +9561,13 @@ mod vram_live_tests {
 
     /// the counters are the process's: one test at a time
     static COUNTERS: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn a_debug_message_id_is_logged_again_in_a_later_window() {
+        let mut seen = (0, 0);
+        assert_eq!((0..20).filter(|_| debug_message_passes(&mut seen, 0)).count(), 8);
+        assert_eq!((0..20).filter(|_| debug_message_passes(&mut seen, 27)).count(), 8);
+    }
 
     #[test]
     fn vram_live_tracks_and_decrements_on_forget() {

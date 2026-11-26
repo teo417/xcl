@@ -539,6 +539,13 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
     let chain = CHAINS.lock().unwrap().get(&pso).cloned();
     let Some(chain) = chain else { list.Dispatch(x, y, z); return Ok(()) };
     if grid.contains(&0) { return Ok(()); }
+    // A bundle cannot record ResourceBarrier (D3D12 spec), and the chain pieces put barriers
+    // between them: run the whole form instead, like execute_indirect does.
+    if list.GetType() == D3D12_COMMAND_LIST_TYPE_BUNDLE {
+        list.SetPipelineState(&chain.whole()?);
+        list.Dispatch(x, y, z);
+        return Ok(());
+    }
     // A title Reset can switch to a different PC allocator while this
     // recording is still submitted on the old one. Retain by backing.
     let allocator = if super::super::alloc_pool::enabled() {
@@ -548,10 +555,10 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
     let needed = grid.into_iter().fold(group, |s, n| s.saturating_mul(n as u64));
     WANTED.fetch_max(needed, Ordering::Relaxed);
     let list_key = list.as_raw() as usize;
-    // No title allocator (a bundle, or a list whose allocator XCL cannot see): XCL owns the
+    // No title allocator (or a list whose allocator XCL cannot see): XCL owns the
     // scratch and keeps it until the title resets the list (D3D12 allows a reset only after the
     // GPU has finished the commands recorded in it), so the pieces run instead of the whole form.
-    let owned = allocator == 0 || list.GetType() == D3D12_COMMAND_LIST_TYPE_BUNDLE;
+    let owned = allocator == 0;
     let scratch = scratch_for(&chain.builder.device, list_key, if owned { 0 } else { allocator }, needed, group);
     let most = scratch.as_ref().map_or(1, |(s, _)| (s.bytes / group).max(1));
     let slabs = pso::dispatch_slabs(grid, most);
@@ -729,10 +736,10 @@ mod scratch_tests {
                 Option::<&ID3D12PipelineState>::None,
             ).expect("bundle");
             bundle.SetComputeRootSignature(&rs);
-            assert!(dispatch(&bundle, pso, 0, [1, 1, 1]).is_ok(), "the bundle records the pieces");
-            assert!(LIST_RECORDINGS.lock().unwrap().get(&(bundle.as_raw() as usize)).is_some_and(|v| !v.is_empty()), "the scratch is kept with the bundle");
-            list_reset(bundle.as_raw() as usize);
-            assert!(!LIST_RECORDINGS.lock().unwrap().contains_key(&(bundle.as_raw() as usize)), "resetting the bundle releases its scratch");
+            // A bundle must run the whole form (no ResourceBarrier allowed in bundles).
+            // With no whole_code, whole() errors – proving dispatch tried the whole-form path.
+            assert!(dispatch(&bundle, pso, 0, [1, 1, 1]).is_err(), "the bundle tried the whole form (not chain pieces)");
+            assert!(LIST_RECORDINGS.lock().unwrap().get(&(bundle.as_raw() as usize)).is_none(), "the bundle has no chain recording");
             drop(bundle);
             drop(alloc);
             forget(pso);

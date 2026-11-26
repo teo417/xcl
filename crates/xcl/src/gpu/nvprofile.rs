@@ -261,7 +261,7 @@ fn parse(args: &[String]) -> Result<Command, String> {
                     _ => return Err(crate::cli::Parser::unexpected(a)),
                 }
             }
-            if !(512..=4096).contains(&mb) {
+            if !(512..=4095).contains(&mb) {
                 return Err(format!("--mb {mb}: expected 512 - 4096"));
             }
             return Ok(Command::Install((mb as u32) << 20));
@@ -319,6 +319,8 @@ mod tests {
         assert_eq!(a(&["remove"]), Ok(Command::Remove));
         assert_eq!(a(&["install"]), Ok(Command::Install(1 << 30)));
         assert_eq!(a(&["install", "--mb", "2048"]), Ok(Command::Install(1 << 31)));
+        assert_eq!(a(&["install", "--mb", "4095"]), Ok(Command::Install(4095u32 << 20)));
+        assert!(a(&["install", "--mb", "4096"]).is_err(), "4096 MB overflows u32 when shifted");
         assert!(a(&["install", "--mb", "100"]).is_err());
         assert!(a(&["install", "--mb"]).is_err());
         assert!(a(&["status", "x"]).is_err());

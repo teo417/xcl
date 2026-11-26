@@ -63,6 +63,9 @@ struct Chain {
     whole_code: Vec<u8>,
     whole: OnceLock<ID3D12PipelineState>,
     build_whole: Mutex<()>,
+    /// a title thread waits for the whole form: its compile, also one the background thread
+    /// has started, takes a wanted build's turn
+    awaited: Arc<std::sync::atomic::AtomicBool>,
     /// its command signature for ExecuteIndirect (`pso::chain_command_signature`)
     signature: OnceLock<ID3D12CommandSignature>,
     /// the most slabs one of its ExecuteIndirects had, the last one read back, and whether one
@@ -75,12 +78,38 @@ struct Chain {
     warned: std::sync::atomic::AtomicBool,
 }
 
+thread_local! {
+    /// the `awaited` of the whole form this thread is building
+    static AWAITED: std::cell::RefCell<Option<Arc<std::sync::atomic::AtomicBool>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The whole form this thread builds is one a title thread waits for.
+pub(super) fn whole_is_awaited() -> bool {
+    AWAITED.with(|a| a.borrow().as_ref().is_some_and(|a| a.load(Ordering::Acquire)))
+}
+
+/// `build`, with its driver compile wanted once `awaited` is set (`whole_is_awaited`).
+fn awaited_build<R>(awaited: &Arc<std::sync::atomic::AtomicBool>, build: impl FnOnce() -> R) -> R {
+    let before = AWAITED.with(|a| a.replace(Some(awaited.clone())));
+    let r = build();
+    AWAITED.with(|a| *a.borrow_mut() = before);
+    r
+}
+
 impl Chain {
+    /// The whole form, for a title thread that cannot go on without it. Without the mark it
+    /// waited on the lock while the background build holding it queued behind every other one.
     unsafe fn whole(&self) -> Result<ID3D12PipelineState, String> {
+        if let Some(p) = self.whole.get() { return Ok(p.clone()); }
+        self.awaited.store(true, Ordering::Release);
+        self.build_whole_now()
+    }
+
+    unsafe fn build_whole_now(&self) -> Result<ID3D12PipelineState, String> {
         if let Some(p) = self.whole.get() { return Ok(p.clone()); }
         let _guard = self.build_whole.lock().unwrap();
         if let Some(p) = self.whole.get() { return Ok(p.clone()); }
-        let p = self.builder.pipeline(&self.whole_code, &pc_iid(Kind::PipelineState)).ok_or("whole compute pipeline")?;
+        let p = awaited_build(&self.awaited, || self.builder.pipeline(&self.whole_code, &pc_iid(Kind::PipelineState))).ok_or("whole compute pipeline")?;
         let _ = self.whole.set(p.clone());
         Ok(p)
     }
@@ -90,7 +119,7 @@ impl Chain {
         if !self.wanted.swap(true, Ordering::Relaxed) {
             let chain = self.clone();
             whole_thread().spawn(move || unsafe {
-                if let Err(e) = chain.whole() { crate::xlog_warn!("D3D12.X: whole form of a split program: {e}"); }
+                if let Err(e) = chain.build_whole_now() { crate::xlog_warn!("D3D12.X: whole form of a split program: {e}"); }
             }).ok();
         }
     }
@@ -126,7 +155,7 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
     let first = pieces.next()?;
     let chain = Arc::new(Chain { builder, tail: pieces.collect(), words: plan.dwords_per_group,
         whole_code: whole.to_vec(), whole: OnceLock::new(), build_whole: Mutex::new(()), signature: OnceLock::new(),
-        slabs: Default::default(), last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() });
+        awaited: Default::default(), slabs: Default::default(), last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() });
     PROGRAMS.fetch_add(1, Ordering::Relaxed);
     PIECES.fetch_add(plan.pieces.len() as u64, Ordering::Relaxed);
     *result = first.into_raw();
@@ -451,7 +480,7 @@ mod scratch_tests {
             let builder = Arc::new(PipelineBuilder { device: dev.clone(), create: no_create, signature: rs.clone(), flags: Default::default(), node: 0, record: 0 });
             let chain = Arc::new(Chain {
                 builder, tail: Vec::new(), words: 4, whole_code: Vec::new(), whole: OnceLock::new(), build_whole: Mutex::new(()),
-                signature: OnceLock::new(), slabs: AtomicU32::new(0), last: Default::default(), measured: Default::default(),
+                awaited: Default::default(), signature: OnceLock::new(), slabs: AtomicU32::new(0), last: Default::default(), measured: Default::default(),
                 wanted: AtomicBool::new(false), warned: AtomicBool::new(false),
             });
             let pso = first.clone().into_raw() as usize;
@@ -569,6 +598,28 @@ mod tests {
     }
 
     #[test]
+    fn a_background_whole_form_a_title_thread_waits_for_takes_a_wanted_turn() {
+        use super::super::{big_compile_turn, driver_compile, huge_pso_bytes, huge_pso_concurrency, BIG_COMPILES};
+        // every background slot taken
+        let held: Vec<_> = (0..huge_pso_concurrency()).map(|_| big_compile_turn(&BIG_COMPILES, || true, || false)).collect();
+        let awaited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = awaited.clone();
+        let t = super::whole_thread().spawn(move || super::awaited_build(&flag, || driver_compile("test", huge_pso_bytes(), true, || 7))).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!t.is_finished(), "nobody waits for it yet: it did not wait for a slot");
+        awaited.store(true, std::sync::atomic::Ordering::Release);
+        let start = std::time::Instant::now();
+        while !t.is_finished() && start.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let finished = t.is_finished();
+        drop(held);
+        assert_eq!(t.join().unwrap(), 7);
+        assert!(finished, "a title thread waits for it, and it still queued with the background builds");
+        assert!(!super::whole_is_awaited(), "this thread builds nothing");
+    }
+
+    #[test]
     fn a_chained_execute_indirect_keeps_its_commands_when_binding_fails() {
         use super::*;
         unsafe extern "system" fn never(_: *mut c_void, _: *const c_void, _: *const GUID, _: *mut *mut c_void) -> HRESULT { E_INVALIDARG }
@@ -587,7 +638,7 @@ mod tests {
             let builder = Arc::new(PipelineBuilder { device: dev.clone(), create: never, signature: rs.clone(), flags: D3D12_PIPELINE_STATE_FLAG_NONE, node: 0, record: 0 });
             let pso = first.as_raw() as usize;
             CHAINS.lock().unwrap().insert(pso, Arc::new(Chain { builder, tail: vec![first.clone()], words: 4, whole_code: Vec::new(), whole: OnceLock::new(),
-                build_whole: Mutex::new(()), signature: OnceLock::new(), slabs: Default::default(), last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() }));
+                build_whole: Mutex::new(()), awaited: Default::default(), signature: OnceLock::new(), slabs: Default::default(), last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() }));
             let ty = D3D12_COMMAND_LIST_TYPE_COMPUTE;
             let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
             let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, None).unwrap();

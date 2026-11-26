@@ -1204,6 +1204,15 @@ static SYNC_GRAPH: Mutex<Option<SyncGraph>> = Mutex::new(None);
 static ARMED_GPU_WAITS: AtomicUsize = AtomicUsize::new(0);
 static SYNC_WATCHDOG_WAKE: OnceLock<(Mutex<()>, Condvar)> = OnceLock::new();
 static QUEUE_IDS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+/// Write64 Signals signalled on the CPU to break a cycle (the first 32 are logged).
+static WRITE64_CYCLE_BREAKS: AtomicU64 = AtomicU64::new(0);
+/// Cells the watchdog released on the CPU so far.
+static WATCHDOG_RELEASES: AtomicU64 = AtomicU64::new(0);
+/// When the watchdog last logged where a chain of waits ends (one line per burst).
+static WAIT_CHAIN_LOGGED: Mutex<Option<Instant>> = Mutex::new(None);
+/// Chain lines logged so far, and the most there will be.
+static WAIT_CHAIN_LINES: AtomicU64 = AtomicU64::new(0);
+const MAX_WAIT_CHAIN_LINES: u64 = 64;
 
 /// A `queue.Wait` XCL itself put on a queue (sparse uploads and readbacks, texture page
 /// mappings). These are not in `SYNC_GRAPH`; the GPU wait watchdog lists the unmet ones, so a
@@ -1581,6 +1590,133 @@ fn wait_expired(aw: &mut ArmedGpuWait, held: bool) -> bool {
     aw.armed_at.elapsed() >= gpu_wait_watchdog_timeout()
 }
 
+/// A tracked `queue.Wait` in flight, as the watchdog's chain walk sees it.
+#[derive(Clone, Copy)]
+struct ChainWait {
+    queue: usize,
+    seq: u64,
+    /// the cell's address (a `Wait64BitValueX`) or the title's fence
+    at: u64,
+    val: u64,
+    /// the cell's `(submitted_max, cpu_signaled_max)` (`None`: a title fence)
+    cell: Option<(u64, u64)>,
+    /// the queue of the earliest `Signal` in flight that satisfies it
+    producer: Option<usize>,
+}
+
+/// How a chain of waits ends.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ChainEnd {
+    /// at a queue already on the chain: every queue on it is held at a wait
+    Cycle,
+    /// at a queue with no tracked wait in front of it
+    Signal,
+    /// at a wait that no submitted `Signal` satisfies
+    Unsubmitted,
+    /// the cell counts the value as submitted, but no `Signal` for it is tracked and the fence is below it
+    SignalGone,
+}
+
+/// True when the last chain line (`logged`) is at least one timeout old and a wait has expired at
+/// `now`. For one timeout after a line the waits are not looked at.
+fn wait_chain_due(graph: &SyncGraph, now: Instant, logged: &Mutex<Option<Instant>>) -> bool {
+    let timeout = gpu_wait_watchdog_timeout();
+    let due = match *logged.lock().unwrap() {
+        Some(t) => now.duration_since(t) >= timeout,
+        None => true,
+    };
+    due && graph.cells.values().any(|c| c.armed_waits.iter().any(|aw| now.duration_since(aw.armed_at) >= timeout))
+}
+
+/// The tracked `queue.Wait` calls and the `(queue, seq)` of the tracked `Signal` calls that have not
+/// completed. Reads the graph and the fences' completed values, changes nothing.
+///
+/// A CPU release drops the cell's `submitted_signals` up to its value although those `Signal`s may
+/// still be queued. After the first one a chain can end in a cycle that is none: the line carries
+/// both counts and is exact only while they are 0.
+unsafe fn calls_in_flight(graph: &SyncGraph) -> (Vec<ChainWait>, Vec<(usize, u64)>) {
+    let (mut waits, mut signals) = (Vec::new(), Vec::new());
+    for (&va, cell) in &graph.cells {
+        if cell.armed_waits.is_empty() && cell.submitted_signals.is_empty() {
+            continue;
+        }
+        let done = cell.fence.as_ref().map_or(0, |f| f.GetCompletedValue());
+        for aw in cell.armed_waits.iter().filter(|aw| aw.val > done) {
+            let producer = cell.submitted_signals.iter().find(|s| s.val >= aw.val).map(|s| s.queue);
+            waits.push(ChainWait {
+                queue: aw.waiting_queue,
+                seq: aw.wait_seq,
+                at: va,
+                val: aw.val,
+                cell: Some((cell.submitted_max, cell.cpu_signaled_max)),
+                producer,
+            });
+        }
+        signals.extend(cell.submitted_signals.iter().filter(|s| s.val > done).map(|s| (s.queue, s.seq)));
+    }
+    for (&raw, tf) in &graph.title_fences {
+        if tf.waits.is_empty() && tf.signals.is_empty() {
+            continue;
+        }
+        let p = raw as *mut c_void;
+        let done = ID3D12Fence::from_raw_borrowed(&p).map_or(0, |f| f.GetCompletedValue());
+        for &(val, queue, seq) in tf.waits.iter().filter(|w| w.0 > done) {
+            let producer = tf.signals.iter().find(|s| s.val >= val).map(|s| s.queue);
+            waits.push(ChainWait { queue, seq, at: raw as u64, val, cell: None, producer });
+        }
+        signals.extend(tf.signals.iter().filter(|s| s.val > done).map(|s| (s.queue, s.seq)));
+    }
+    (waits, signals)
+}
+
+/// Follows the tracked waits from queue `start`. A queue is held at its earliest call in flight:
+/// when that is a wait, the chain goes on at the queue of the `Signal` that satisfies it.
+fn wait_chain(waits: &[ChainWait], signals: &[(usize, u64)], start: usize) -> (Vec<ChainWait>, usize, ChainEnd) {
+    let mut hops: Vec<ChainWait> = Vec::new();
+    let mut q = start;
+    loop {
+        if hops.iter().any(|h| h.queue == q) {
+            return (hops, q, ChainEnd::Cycle);
+        }
+        let first_signal = signals.iter().filter(|s| s.0 == q).map(|s| s.1).min().unwrap_or(u64::MAX);
+        let Some(&w) = waits.iter().filter(|w| w.queue == q && w.seq < first_signal).min_by_key(|w| w.seq) else {
+            return (hops, q, ChainEnd::Signal);
+        };
+        hops.push(w);
+        match w.producer {
+            Some(pq) => q = pq,
+            None if w.cell.is_some_and(|c| c.0 >= w.val) => return (hops, q, ChainEnd::SignalGone),
+            None => return (hops, q, ChainEnd::Unsubmitted),
+        }
+    }
+}
+
+/// The chain from the first of `waiters`, and how many of those cells end the same way at the same queue.
+fn wait_chain_line(waits: &[ChainWait], signals: &[(usize, u64)], waiters: &[usize]) -> Option<String> {
+    let (hops, end_q, end) = wait_chain(waits, signals, *waiters.first()?);
+    let same = waiters.iter().map(|&w| wait_chain(waits, signals, w)).filter(|c| (c.1, c.2) == (end_q, end)).count();
+    let mut line = String::new();
+    for h in &hops {
+        let what = if h.cell.is_some() { "Wait64" } else { "Wait" };
+        line += &format!("q{} {what}({:#x}>={:#x}) -> ", queue_id(h.queue), h.at, h.val);
+    }
+    line += &match end {
+        ChainEnd::Cycle => format!("q{} end=cycle (every queue on the chain is held at a wait)", queue_id(end_q)),
+        ChainEnd::Signal => format!(
+            "q{} end=signal (no tracked wait in front of it: executing, or behind a wait XCL does not track)",
+            queue_id(end_q)
+        ),
+        ChainEnd::Unsubmitted => "end=unsubmitted (no Signal for it is submitted)".to_string(),
+        ChainEnd::SignalGone => {
+            let (sub, cpu) = hops.last().and_then(|h| h.cell).unwrap_or_default();
+            format!(
+                "end=signal-gone (cell submitted={sub:#x} cpu_signaled={cpu:#x}: no Signal for it is tracked any more and the fence is below it)"
+            )
+        }
+    };
+    Some(format!("{line}; same_end={same}/{} (expired cells this tick)", waiters.len()))
+}
+
 fn wake_sync_watchdog() {
     let pair = sync_watchdog_pair(&SYNC_WATCHDOG_WAKE, || {
         let _ = std::thread::Builder::new().name("xcl-sync-watchdog".into()).spawn(|| loop {
@@ -1589,11 +1725,21 @@ fn wake_sync_watchdog() {
                 continue;
             };
             let _ = pair.1.wait_timeout(guard, Duration::from_millis(50)).unwrap();
-            let (expired, rewinds) = {
+            let (expired, rewinds, in_flight) = {
                 let mut g = SYNC_GRAPH.lock().unwrap();
                 let mut out: Vec<(u64, u64, ID3D12Fence, usize, i32, Option<usize>, Option<i32>, u64, u64, u64)> = Vec::new();
                 let mut rew: Vec<(ID3D12Fence, u64)> = Vec::new();
+                let mut in_flight = None;
+                let now = Instant::now();
                 if let Some(graph) = g.as_mut() {
+                    // Same waits the release below will see. Skipped while a pipeline build holds
+                    // the title: `wait_expired` resets those clocks, so nothing expires this tick.
+                    if !super::pso_async::title_held()
+                        && WAIT_CHAIN_LINES.load(Ordering::Relaxed) < MAX_WAIT_CHAIN_LINES
+                        && wait_chain_due(graph, now, &WAIT_CHAIN_LOGGED)
+                    {
+                        in_flight = Some(unsafe { calls_in_flight(graph) });
+                    }
                     for (&va, cell) in graph.cells.iter_mut() {
                         if cell.armed_waits.is_empty() && cell.cpu_signaled_max == 0 {
                             continue;
@@ -1652,7 +1798,7 @@ fn wake_sync_watchdog() {
                         }
                     }
                 }
-                (out, rew)
+                (out, rew, in_flight)
             };
             for (fence, val) in rewinds {
                 unsafe {
@@ -1660,6 +1806,8 @@ fn wake_sync_watchdog() {
                 }
             }
             let had_expired = !expired.is_empty();
+            let expired_count = expired.len();
+            let waiters: Vec<usize> = expired.iter().map(|e| e.3).collect();
             for (va, val, fence, waiter_q, waiter_ty, prod_q, prod_ty, rec, sub, done) in expired {
                 unsafe {
                     let _ = fence.Signal(val);
@@ -1672,6 +1820,21 @@ fn wake_sync_watchdog() {
                 );
             }
             if had_expired {
+                if let Some((waits, signals)) = in_flight {
+                    if WAIT_CHAIN_LINES.load(Ordering::Relaxed) < MAX_WAIT_CHAIN_LINES {
+                        if let Some(line) = wait_chain_line(&waits, &signals, &waiters) {
+                            *WAIT_CHAIN_LOGGED.lock().unwrap() = Some(Instant::now());
+                            WAIT_CHAIN_LINES.fetch_add(1, Ordering::Relaxed);
+                            crate::xlog_warn!(
+                                "D3D12.X: GPU wait chain: {line}, earlier_releases={}, write64_cycle_breaks={}, sparse queue {}",
+                                WATCHDOG_RELEASES.load(Ordering::Relaxed),
+                                WRITE64_CYCLE_BREAKS.load(Ordering::Relaxed),
+                                super::sparse::fence_status()
+                            );
+                        }
+                    }
+                }
+                WATCHDOG_RELEASES.fetch_add(expired_count as u64, Ordering::Relaxed);
                 crate::xlog_warn!("D3D12.X: pending title ID3D12Fences during GPU wait timeout: {}", super::fence_x::pending_summary());
                 crate::xlog_warn!("D3D12.X: XCL's own queue waits unmet during GPU wait timeout: {}", internal_waits_summary());
             }
@@ -1910,8 +2073,7 @@ unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
             SignalAction::CpuCycleBreak(waiters) => {
                 publish_cpu_cycle_break(va, val);
                 let _ = fence.Signal(val);
-                static BREAK_WARN: AtomicU64 = AtomicU64::new(0);
-                if once(&BREAK_WARN, 32) {
+                if once(&WRITE64_CYCLE_BREAKS, 32) {
                     let sq = queue_id(sig_q);
                     let mut wids: Vec<String> = waiters
                         .into_iter()
@@ -4813,6 +4975,80 @@ pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, hea
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// The watchdog's chain walk, on graphs built by hand (no GPU): a cycle, a queue that is
+    /// executing, a wait nothing submitted satisfies, and a signal the graph no longer tracks.
+    #[test]
+    fn wait_chain_names_where_expired_waits_end() {
+        let now = Instant::now();
+        let (qa, qb, qc) = (0xA001usize, 0xB001usize, 0xC001usize);
+        let wait = |queue, seq| ArmedGpuWait {
+            val: 7,
+            waiting_queue: queue,
+            waiting_queue_ty: 0,
+            wait_seq: seq,
+            armed_at: now,
+            after_write64: false,
+        };
+        let cell = |waits: Vec<ArmedGpuWait>, signals: Vec<(usize, u64)>, submitted: u64| SyncCell {
+            submitted_max: submitted,
+            armed_waits: waits,
+            submitted_signals: signals.into_iter().map(|(queue, seq)| SubmittedSignal { val: 7, queue, seq }).collect(),
+            ..SyncCell::default()
+        };
+        let ends = |g: &SyncGraph, start: usize| {
+            let (waits, signals) = unsafe { calls_in_flight(g) };
+            let (hops, end_q, end) = wait_chain(&waits, &signals, start);
+            (hops.iter().map(|h| (h.queue, h.at)).collect::<Vec<_>>(), end_q, end)
+        };
+        let line = |g: &SyncGraph, waiters: &[usize]| {
+            let (waits, signals) = unsafe { calls_in_flight(g) };
+            wait_chain_line(&waits, &signals, waiters)
+        };
+
+        let mut g = SyncGraph::default();
+        g.cells.insert(0x1000, cell(vec![wait(qa, 1)], vec![(qb, 2)], 7));
+        g.cells.insert(0x2000, cell(vec![wait(qb, 1)], vec![(qa, 2)], 7));
+        assert_eq!(ends(&g, qa), (vec![(qa, 0x1000), (qb, 0x2000)], qa, ChainEnd::Cycle));
+        let cycle = line(&g, &[qa, qc]).unwrap();
+        assert!(
+            cycle.contains(" Wait64(0x2000>=0x7) -> q") && cycle.contains(" end=cycle (") && cycle.ends_with("; same_end=1/2 (expired cells this tick)"),
+            "{cycle}"
+        );
+
+        g.cells.insert(0x2000, cell(vec![], vec![(qa, 2)], 7));
+        assert_eq!(ends(&g, qa), (vec![(qa, 0x1000)], qb, ChainEnd::Signal));
+        g.cells.insert(0x2000, cell(vec![wait(qb, 1)], vec![(qc, 1)], 7));
+        assert_eq!(ends(&g, qa), (vec![(qa, 0x1000), (qb, 0x2000)], qc, ChainEnd::Signal));
+        assert_eq!(ends(&g, qc), (vec![], qc, ChainEnd::Signal));
+        let signal = line(&g, &[qa, qb, qc]).unwrap();
+        assert!(
+            signal.contains("Wait64(0x1000>=0x7) -> ") && signal.contains(" end=signal (no tracked wait in front of it") && signal.contains("; same_end=3/3 "),
+            "{signal}"
+        );
+        assert!(line(&g, &[]).is_none());
+
+        g.cells.insert(0x2000, cell(vec![wait(qb, 1)], vec![], 6));
+        assert_eq!(ends(&g, qa), (vec![(qa, 0x1000), (qb, 0x2000)], qb, ChainEnd::Unsubmitted));
+        g.cells.insert(0x2000, cell(vec![wait(qb, 1)], vec![], 7));
+        assert_eq!(ends(&g, qa).2, ChainEnd::SignalGone);
+        let gone = line(&g, &[qa]).unwrap();
+        assert!(gone.contains(" -> end=signal-gone (cell submitted=0x7 cpu_signaled=0x0: "), "{gone}");
+        let title = ChainWait { queue: qa, seq: 1, at: 0xF00, val: 3, cell: None, producer: None };
+        assert_eq!(wait_chain(&[title], &[], qa).2, ChainEnd::Unsubmitted);
+        assert!(wait_chain_line(&[title], &[], &[qa]).unwrap().contains(" Wait(0xf00>=0x3) -> end=unsubmitted "));
+
+        let logged = Mutex::new(None);
+        assert!(!wait_chain_due(&g, now, &logged), "no wait has expired");
+        let old = now.checked_sub(gpu_wait_watchdog_timeout()).expect("up for longer than the timeout");
+        g.cells.get_mut(&0x1000).unwrap().armed_waits[0].armed_at = old;
+        assert!(wait_chain_due(&g, now, &logged), "a wait that is one timeout old starts a burst");
+        *logged.lock().unwrap() = Some(now);
+        assert!(!wait_chain_due(&g, now, &logged), "a burst gets one line");
+        *logged.lock().unwrap() = Some(old);
+        assert!(wait_chain_due(&g, now, &logged), "the next burst gets its own");
+    }
+
 
     /// A list made at the address of a released one does not share the split programs' scratch
     /// of the old one's recordings, which the GPU may still run (#2588: addresses are reused)

@@ -85,6 +85,14 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     mb(pools as u64),
                     mb(pools_mapped as u64)
                 );
+                let vl = crate::hle::d3d12x::real::vram_live_bytes();
+                crate::xlog_info!(
+                    "vram-live: title_heaps (local {} MB, nonlocal {} MB), committed (local {} MB, nonlocal {} MB)",
+                    mb(vl[0]),
+                    mb(vl[1]),
+                    mb(vl[2]),
+                    mb(vl[3])
+                );
                 let va = crate::hle::d3d12x::real::vram_alloc_bytes();
                 crate::xlog_info!(
                     "vram-allocs (cumulative): title heaps {} MB, placed-own {} MB; chain scratch {} MB, cmd_pool {} MB (allocs {} in {} ms, reuses {})",

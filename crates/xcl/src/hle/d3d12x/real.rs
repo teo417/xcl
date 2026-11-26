@@ -442,6 +442,31 @@ pub fn video_memory() -> Option<(u64, u64)> {
 
 static VRAM_TITLE_HEAPS: AtomicU64 = AtomicU64::new(0);
 static VRAM_PLACED_OWN: AtomicU64 = AtomicU64::new(0);
+/// Live byte counters: [0]=title_heap_local, [1]=title_heap_nonlocal, [2]=committed_local, [3]=committed_nonlocal
+static VRAM_LIVE_BUCKETS: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static VRAM_LIVE_MAP: Mutex<Option<HashMap<usize, (usize, u64)>>> = Mutex::new(None);
+
+fn note_vram_live(ptr: usize, bucket: usize, bytes: u64) {
+    if ptr == 0 || bytes == 0 || bucket >= VRAM_LIVE_BUCKETS.len() {
+        return;
+    }
+    let mut g = VRAM_LIVE_MAP.lock().unwrap();
+    let map = g.get_or_insert_with(HashMap::new);
+    if let Some((old_b, old_bytes)) = map.insert(ptr, (bucket, bytes)) {
+        VRAM_LIVE_BUCKETS[old_b].fetch_sub(old_bytes, Ordering::Relaxed);
+    }
+    VRAM_LIVE_BUCKETS[bucket].fetch_add(bytes, Ordering::Relaxed);
+}
+
+fn forget_vram_live(ptr: usize) {
+    if ptr == 0 {
+        return;
+    }
+    let gone = VRAM_LIVE_MAP.lock().unwrap().as_mut().and_then(|m| m.remove(&ptr));
+    if let Some((bucket, bytes)) = gone {
+        VRAM_LIVE_BUCKETS[bucket].fetch_sub(bytes, Ordering::Relaxed);
+    }
+}
 
 /// `[title_heaps_bytes, placed_own_bytes, chain_scratch_live, chain_cmd_pool_bytes, chain_cmd_allocs, chain_cmd_reuses, chain_cmd_alloc_micros]`
 pub fn vram_alloc_bytes() -> [u64; 7] {
@@ -454,6 +479,16 @@ pub fn vram_alloc_bytes() -> [u64; 7] {
         allocs,
         reuses,
         micros,
+    ]
+}
+
+/// Live (decremented on Release) `[title_heap_local, title_heap_nonlocal, committed_local, committed_nonlocal]`
+pub fn vram_live_bytes() -> [u64; 4] {
+    [
+        VRAM_LIVE_BUCKETS[0].load(Ordering::Relaxed),
+        VRAM_LIVE_BUCKETS[1].load(Ordering::Relaxed),
+        VRAM_LIVE_BUCKETS[2].load(Ordering::Relaxed),
+        VRAM_LIVE_BUCKETS[3].load(Ordering::Relaxed),
     ]
 }
 
@@ -1702,6 +1737,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         f(this)
     };
     if n == 0 {
+        forget_vram_live(this as usize);
         if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
             s.remove(&(this as usize));
         }
@@ -3219,9 +3255,56 @@ pub(super) unsafe fn create_raw_pc_command_list(
     (hr >= 0 && !out.is_null()).then_some(out)
 }
 creator!(dev_create_descriptor_heap, "CreateDescriptorHeap", Kind::DescriptorHeap, [a1]);
-creator!(dev_create_committed_resource, "CreateCommittedResource", Kind::Resource, [a1, a2, a3, a4, a5]);
-creator!(dev_create_committed_resource1, "CreateCommittedResource1", Kind::Resource, [a1, a2, a3, a4, a5, a6]);
-creator!(dev_create_committed_resource2, "CreateCommittedResource2", Kind::Resource, [a1, a2, a3, a4, a5, a6]);
+creator!(dev_create_committed_resource_pc, "CreateCommittedResource", Kind::Resource, [a1, a2, a3, a4, a5]);
+creator!(dev_create_committed_resource1_pc, "CreateCommittedResource1", Kind::Resource, [a1, a2, a3, a4, a5, a6]);
+creator!(dev_create_committed_resource2_pc, "CreateCommittedResource2", Kind::Resource, [a1, a2, a3, a4, a5, a6]);
+
+unsafe fn note_committed_live(this: *mut c_void, heap_props: usize, desc: usize, ppv: *mut *mut c_void) {
+    if ppv.is_null() || (*ppv).is_null() || heap_props == 0 || desc == 0 {
+        return;
+    }
+    if !crate::gpu::shader::readable(heap_props, std::mem::size_of::<D3D12_HEAP_PROPERTIES>())
+        || !crate::gpu::shader::readable(desc, std::mem::size_of::<D3D12_RESOURCE_DESC>())
+    {
+        return;
+    }
+    let hp: D3D12_HEAP_PROPERTIES = std::ptr::read_unaligned(heap_props as *const D3D12_HEAP_PROPERTIES);
+    let rd: D3D12_RESOURCE_DESC = std::ptr::read_unaligned(desc as *const D3D12_RESOURCE_DESC);
+    let bytes = if rd.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
+        rd.Width
+    } else {
+        let raw = (desc as *const [u8; 0x38]).read_unaligned();
+        let sz = pc_allocation_size(this, &raw);
+        if sz == u64::MAX { 0 } else { sz }
+    };
+    let is_local = hp.Type == D3D12_HEAP_TYPE_DEFAULT
+        || (hp.Type == D3D12_HEAP_TYPE_CUSTOM && hp.MemoryPoolPreference == D3D12_MEMORY_POOL_L1);
+    note_vram_live(*ppv as usize, if is_local { 2 } else { 3 }, bytes);
+}
+
+pub(super) unsafe extern "system" fn dev_create_committed_resource(this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let hr = dev_create_committed_resource_pc(this, a1, a2, a3, a4, a5, riid, ppv);
+    if hr >= 0 {
+        note_committed_live(this, a1, a3, ppv);
+    }
+    hr
+}
+
+pub(super) unsafe extern "system" fn dev_create_committed_resource1(this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let hr = dev_create_committed_resource1_pc(this, a1, a2, a3, a4, a5, a6, riid, ppv);
+    if hr >= 0 {
+        note_committed_live(this, a1, a3, ppv);
+    }
+    hr
+}
+
+pub(super) unsafe extern "system" fn dev_create_committed_resource2(this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let hr = dev_create_committed_resource2_pc(this, a1, a2, a3, a4, a5, a6, riid, ppv);
+    if hr >= 0 {
+        note_committed_live(this, a1, a3, ppv);
+    }
+    hr
+}
 creator!(dev_create_placed_resource, "CreatePlacedResource", Kind::Resource, [a1, a2, a3, a4, a5]);
 
 /// D3D12_RESOURCE_STATES the PC knows (as `list_x::PC_STATES`)
@@ -3492,6 +3575,9 @@ unsafe fn note_heap_uma(desc: usize, ppv: *mut *mut c_void) {
     let d: D3D12_HEAP_DESC = std::ptr::read_unaligned(desc as *const D3D12_HEAP_DESC);
     if d.SizeInBytes != 0 {
         VRAM_TITLE_HEAPS.fetch_add(d.SizeInBytes, Ordering::Relaxed);
+        let is_local = d.Properties.Type == D3D12_HEAP_TYPE_DEFAULT
+            || (d.Properties.Type == D3D12_HEAP_TYPE_CUSTOM && d.Properties.MemoryPoolPreference == D3D12_MEMORY_POOL_L1);
+        note_vram_live(*ppv as usize, if is_local { 0 } else { 1 }, d.SizeInBytes);
     }
     if d.Flags.0 & DENY_BUFFERS != 0 || d.SizeInBytes == 0 || UMA_BUFFER.lock().unwrap().is_empty() {
         return;
@@ -3580,6 +3666,7 @@ unsafe extern "system" fn mem_heap_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
     if n == 0 {
+        forget_vram_live(this as usize);
         let gone = HEAP_UMA.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize))).and_then(|e| e.block);
         if let (Some(p), Some(u)) = (gone, crate::gpu::uma::get()) {
             if u.is_sparse(p) {
@@ -9192,6 +9279,28 @@ void main() {
                 "companion SRVs (1D, 1DArray, 2D, 2DArray, 3D), null image views, and copied staging slots must all read back accurately"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod vram_live_tests {
+    use super::*;
+
+    #[test]
+    fn vram_live_tracks_and_decrements_on_forget() {
+        let before = vram_live_bytes();
+        let ptr_heap = 0xCAFE_0001usize;
+        let ptr_comm = 0xCAFE_0002usize;
+        note_vram_live(ptr_heap, 0, 4 << 20);
+        note_vram_live(ptr_comm, 2, 8 << 20);
+        let mid = vram_live_bytes();
+        assert_eq!(mid[0] - before[0], 4 << 20);
+        assert_eq!(mid[2] - before[2], 8 << 20);
+        forget_vram_live(ptr_heap);
+        forget_vram_live(ptr_comm);
+        let after = vram_live_bytes();
+        assert_eq!(after[0], before[0]);
+        assert_eq!(after[2], before[2]);
     }
 }
 

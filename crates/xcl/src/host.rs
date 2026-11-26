@@ -106,6 +106,16 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     va[6] / 1000,
                     va[5]
                 );
+                if crate::hle::d3d12x::gpu_timing::enabled() {
+                    let gt = crate::hle::d3d12x::gpu_timing::activity();
+                    crate::xlog_info!(
+                        "gpu-timing (total): {} submits ({} lists), {} ms GPU time (max {} ms)",
+                        gt[0],
+                        gt[1],
+                        gt[2] / 1000,
+                        gt[3] / 1000
+                    );
+                }
                 let pso = crate::hle::d3d12x::pso_async::activity();
                 let pso_active = pso[1].saturating_sub(pso[2] + pso[3]);
                 crate::xlog_info!(

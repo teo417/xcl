@@ -19,6 +19,7 @@ mod cpu_writes;
 pub mod dred;
 mod fence_x;
 pub mod frame;
+pub mod gpu_timing;
 pub mod guard;
 mod late_release;
 pub mod layout;

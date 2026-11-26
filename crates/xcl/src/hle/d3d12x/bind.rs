@@ -34,7 +34,6 @@ struct State {
     uma: Vec<usize>,
     /// where the next draw's io and argument table go (blocks in `uma`)
     arena: crate::gpu::uma::Arena,
-    res_buf: Option<(ID3D12Resource, u64, usize)>,
     res_retired: Vec<(ID3D12Resource, u64, usize)>,
     /// rewritten indirect arguments (`scratch_args`): active block, bytes used, total taken
     scratch: Option<(ID3D12Resource, u64, usize)>,
@@ -48,6 +47,10 @@ const FREE_RES_CAP: u64 = 256 << 20;
 
 static ALLOC_RES: Mutex<Option<HashMap<usize, Vec<(ID3D12Resource, u64, usize)>>>> = Mutex::new(None);
 static FREE_RES: Mutex<Vec<(ID3D12Resource, u64, usize)>> = Mutex::new(Vec::new());
+/// the record buffers of two-pass draws, by size and device (`ensure_res_buffer`)
+static RECORD_RES: Mutex<Vec<(ID3D12Resource, u64, usize)>> = Mutex::new(Vec::new());
+/// the least a record buffer holds (what an indirect draw asks for)
+const RECORD_LEAST: u64 = 32 << 20;
 
 fn hold_res_until_reset(allocator: usize, mut bufs: Vec<(ID3D12Resource, u64, usize)>) {
     if bufs.is_empty() || allocator == 0 {
@@ -233,11 +236,7 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.args_gfx.clear();
         s.rs_gfx = 0;
         (s.scratch, s.scratch_used, s.scratch_taken) = (None, 0, 0);
-        let mut res_bufs = std::mem::take(&mut s.res_retired);
-        if let Some(b) = s.res_buf.take() {
-            res_bufs.push(b);
-        }
-        (old, std::mem::take(&mut s.uma), res_bufs)
+        (old, std::mem::take(&mut s.uma), std::mem::take(&mut s.res_retired))
     });
     console_list::hold_until_reset(old, blocks);
     hold_res_until_reset(old, res_bufs);
@@ -297,9 +296,6 @@ pub(super) fn pass_arena(from: *mut c_void, to: *mut c_void) {
 pub(super) fn forget(list: *mut c_void) {
     if let Some(mut s) = STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize))) {
         console_list::hold_until_reset(s.allocator, s.uma);
-        if let Some(b) = s.res_buf.take() {
-            s.res_retired.push(b);
-        }
         hold_res_until_reset(s.allocator, s.res_retired);
     }
 }
@@ -522,30 +518,34 @@ fn two_pass_steps(max: u32) -> impl Iterator<Item = (u32, bool)> {
     (0..max).flat_map(|k| [(k, true), (k, false)])
 }
 
+/// The record buffer for a two-pass draw on `this` that needs `need_bytes`, its address and
+/// size. All recordings share it: a pass's records are written and read between UAV barriers on
+/// it, so on one queue (a title's mesh shaders run on its graphics queue) the next pass, of this
+/// list or a later one, starts after them. A buffer per list instead took a retail title's world
+/// 2.6 GB of video memory (84 of 32 MiB), past what a 16 GB card had left.
 unsafe fn ensure_res_buffer(this: *mut c_void, need_bytes: u64) -> Result<(ID3D12Resource, u64, u64), String> {
-    let need = need_bytes.max(4 << 20).next_multiple_of(1 << 20).min(128 << 20);
-    if let Some((buf, cap, _dev)) = with(this, |s| s.res_buf.as_ref().filter(|(_, cap, _)| *cap >= need).cloned()) {
-        let va = buf.GetGPUVirtualAddress();
-        return Ok((buf, va, cap));
-    }
     let dev = super::real::list_device(this).ok_or("no device for two-pass buffer")?;
-    let dev_key = dev.as_raw() as usize;
-    let picked = {
-        let mut free = FREE_RES.lock().unwrap();
-        free.iter().position(|(_, cap, d)| *d == dev_key && *cap >= need).map(|i| free.swap_remove(i))
-    };
-    let entry = match picked {
-        Some(e) => e,
-        None => (default_uav_buffer(&dev, need, "two-pass res buffer")?, need, dev_key),
-    };
-    let (buf, cap) = (entry.0.clone(), entry.1);
+    let (buf, cap) = record_buffer(&dev, need_bytes)?;
     let va = buf.GetGPUVirtualAddress();
-    with(this, |s| {
-        if let Some(old) = s.res_buf.replace(entry) {
-            s.res_retired.push(old);
-        }
-    });
     Ok((buf, va, cap))
+}
+
+/// The size of the record buffer for `need_bytes`: few sizes, as every one made is kept (a
+/// recording may use it until its allocator is reset).
+fn record_buffer_size(need_bytes: u64) -> u64 {
+    need_bytes.clamp(RECORD_LEAST, 128 << 20).next_power_of_two()
+}
+
+unsafe fn record_buffer(dev: &ID3D12Device, need_bytes: u64) -> Result<(ID3D12Resource, u64), String> {
+    let need = record_buffer_size(need_bytes);
+    let dev_key = dev.as_raw() as usize;
+    let mut made = RECORD_RES.lock().unwrap();
+    if let Some((buf, cap, _)) = made.iter().find(|(_, cap, d)| *d == dev_key && *cap >= need) {
+        return Ok((buf.clone(), *cap));
+    }
+    let buf = default_uav_buffer(dev, need, "two-pass res buffer")?;
+    made.push((buf.clone(), need, dev_key));
+    Ok((buf, need))
 }
 
 fn two_pass_io(layout: Option<&Layout>, args: &[u8], table_at: u64, compute_pass: bool, uma_base: usize) -> Vec<u32> {
@@ -2732,6 +2732,34 @@ void main(uint t : SV_GroupIndex) {
         assert_eq!(record_groups(128 << 20, record, 1), 2817);
         assert_eq!(record_groups(1 << 30, 64, 7), 65_535 / 7);
         assert_eq!(record_groups(1 << 20, 2 << 20, 1), 0);
+    }
+
+    #[test]
+    fn two_pass_draws_share_a_record_buffer_on_d3d12() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+
+        assert_eq!(record_buffer_size(1), 32 << 20);
+        assert_eq!(record_buffer_size((32 << 20) + 1), 64 << 20);
+        assert_eq!(record_buffer_size(u64::MAX), 128 << 20);
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
+                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+            }
+            let dev = dev.expect("D3D12 device");
+            let (a, cap) = record_buffer(&dev, 4 << 20).expect("record buffer");
+            assert_eq!((cap, a.GetDesc().Width), (32 << 20, 32 << 20));
+            let (b, _) = record_buffer(&dev, 32 << 20).expect("record buffer");
+            assert_eq!(a.as_raw(), b.as_raw());
+            let (large, cap) = record_buffer(&dev, 40 << 20).expect("record buffer");
+            assert_eq!(cap, 64 << 20);
+            assert_ne!(large.as_raw(), a.as_raw());
+            let (c, _) = record_buffer(&dev, 1).expect("record buffer");
+            assert_eq!(a.as_raw(), c.as_raw());
+        }
     }
 
     #[test]

@@ -80,9 +80,7 @@ struct Chain {
     waiting: std::sync::atomic::AtomicUsize,
     /// its command signature for ExecuteIndirect (`pso::chain_command_signature`)
     signature: OnceLock<ID3D12CommandSignature>,
-    /// the most slabs one of its ExecuteIndirects had, the last one read back, and whether one
-    /// was read back yet
-    slabs: std::sync::atomic::AtomicU32,
+    /// the slabs of the last of its ExecuteIndirects read back, and whether one was read back yet
     last: std::sync::atomic::AtomicU32,
     measured: std::sync::atomic::AtomicBool,
     /// its whole form was asked for in the background / a lost slab was reported
@@ -195,7 +193,7 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
     let first = pieces.next()?;
     let chain = Arc::new(Chain { builder, tail: pieces.collect(), words: plan.dwords_per_group,
         whole_code: whole.to_vec(), whole: OnceLock::new(), build_whole: Mutex::new(()), waiting: Default::default(), signature: OnceLock::new(),
-        slabs: Default::default(), last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() });
+        last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() });
     PROGRAMS.fetch_add(1, Ordering::Relaxed);
     PIECES.fetch_add(plan.pieces.len() as u64, Ordering::Relaxed);
     *result = first.into_raw();
@@ -255,7 +253,6 @@ impl Recording {
         if unsafe { i.commands.Map(0, Some(&range), Some(&mut p)) }.is_err() { return; }
         let [partial, _, slabs, _] = unsafe { std::ptr::read_volatile((p as *const u8).add(i.at as usize) as *const [u32; 4]) };
         unsafe { i.commands.Unmap(0, Some(&D3D12_RANGE::default())) };
-        self.chain.slabs.fetch_max(slabs, Ordering::Relaxed);
         self.chain.last.store(slabs, Ordering::Relaxed);
         self.chain.measured.store(true, Ordering::Relaxed);
         if partial == 0 { return; }
@@ -514,12 +511,13 @@ fn indirect_rounds(seen: &[[u32; 3]], most: u64, before: Option<u32>, cap: u32) 
     (want + want.div_ceil(4)).clamp(2, u64::from(cap.max(2))) as u32
 }
 
-/// The slabs of an earlier ExecuteIndirect of the program for `indirect_rounds` (None: none was
-/// read back yet). Until its whole form is built, the most any had: slabs past the rounds are
-/// lost. Then the last one's, as more run the whole form: every round costs its pieces'
-/// ExecuteIndirects, also when empty (each ~14 us of GPU after its barrier on an RTX 5070 Ti, #2404).
-fn slabs_before(measured: bool, whole: bool, most: u32, last: u32) -> Option<u32> {
-    measured.then_some(if whole { last } else { most })
+/// The slabs of an earlier ExecuteIndirect of the program for `indirect_rounds`: None (the most
+/// rounds) until one was read back and its whole form is built, as slabs past the rounds are
+/// lost until then (one program's first ExecuteIndirects had a slab, a later one 22, #2404). Then
+/// the last one's, as more run the whole form: every round costs its pieces' ExecuteIndirects,
+/// also when empty (each ~14 us of GPU after its barrier on an RTX 5070 Ti, #2404).
+fn slabs_before(measured: bool, whole: bool, last: u32) -> Option<u32> {
+    (measured && whole).then_some(last)
 }
 
 /// An ExecuteIndirect of split program `pso` whose command signature is one Dispatch of `stride`
@@ -549,7 +547,7 @@ pub(in crate::hle::d3d12x) unsafe fn execute_indirect(list: &ID3D12GraphicsComma
         None => { let s = pso::chain_command_signature(dev, &chain.builder.signature)?; chain.signature.get_or_init(|| s).clone() }
     };
     let full = chain.whole.get().cloned().map(|p| pso::dispatch_command_signature(dev).map(|s| (p, s))).transpose()?;
-    let before = slabs_before(chain.measured.load(Ordering::Relaxed), full.is_some(), chain.slabs.load(Ordering::Relaxed), chain.last.load(Ordering::Relaxed));
+    let before = slabs_before(chain.measured.load(Ordering::Relaxed), full.is_some(), chain.last.load(Ordering::Relaxed));
     let rounds = indirect_rounds(seen, most, before, most_rounds());
     let pieces = chain.tail.len() as u32 + 1;
     let at = pso::chain_tail_offset(rounds, pieces);
@@ -732,14 +730,15 @@ mod tests {
     #[test]
     fn once_the_whole_form_is_built_the_last_execute_indirect_sizes_the_rounds() {
         use super::{indirect_rounds, slabs_before};
-        assert_eq!(slabs_before(false, true, 17, 1), None);
-        // not built: the most slabs any had, so that none are lost
-        assert_eq!(slabs_before(true, false, 17, 1), Some(17));
-        assert_eq!(indirect_rounds(&[[0, 0, 0]], 1, slabs_before(true, false, 17, 1), 32), 22);
+        assert_eq!(slabs_before(false, true, 1), None);
+        // not built: the most rounds, also after one of a slab was read back (a later one can
+        // have 22, whose slabs past the rounds would be lost)
+        assert_eq!(slabs_before(true, false, 1), None);
+        assert_eq!(indirect_rounds(&[[0, 0, 0]], 1, slabs_before(true, false, 1), 32), 32);
         // built: the last one's, an overflow runs the whole form
-        assert_eq!(slabs_before(true, true, 17, 1), Some(1));
-        assert_eq!(indirect_rounds(&[[0, 0, 0]], 1, slabs_before(true, true, 17, 1), 32), 2);
-        assert_eq!(indirect_rounds(&[[3, 1, 1]], 1, slabs_before(true, true, 17, 1), 32), 4);
+        assert_eq!(slabs_before(true, true, 1), Some(1));
+        assert_eq!(indirect_rounds(&[[0, 0, 0]], 1, slabs_before(true, true, 1), 32), 2);
+        assert_eq!(indirect_rounds(&[[3, 1, 1]], 1, slabs_before(true, true, 1), 32), 4);
     }
 
     #[test]
@@ -774,7 +773,7 @@ mod tests {
             let builder = Arc::new(PipelineBuilder { device: dev.clone(), create: never, signature: rs.clone(), flags: D3D12_PIPELINE_STATE_FLAG_NONE, node: 0, record: 0 });
             let pso = first.as_raw() as usize;
             CHAINS.lock().unwrap().insert(pso, Arc::new(Chain { builder, tail: vec![first.clone()], words: 4, whole_code: Vec::new(), whole: OnceLock::new(),
-                build_whole: Mutex::new(()), waiting: Default::default(), signature: OnceLock::new(), slabs: Default::default(), last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() }));
+                build_whole: Mutex::new(()), waiting: Default::default(), signature: OnceLock::new(), last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() }));
             let ty = D3D12_COMMAND_LIST_TYPE_COMPUTE;
             let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
             let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, None).unwrap();
@@ -886,7 +885,7 @@ mod tests {
             let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
             code[..16].copy_from_slice(&nonce.to_le_bytes());
             let chain = Arc::new(Chain { builder, tail: Vec::new(), words: 4, whole_code: code, whole: OnceLock::new(),
-                build_whole: Mutex::new(()), waiting: Default::default(), signature: OnceLock::new(), slabs: Default::default(), last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() });
+                build_whole: Mutex::new(()), waiting: Default::default(), signature: OnceLock::new(), last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() });
             let held: Vec<_> = (0..huge_pso_concurrency()).map(|_| big_compile_turn(&BIG_COMPILES, || true, || false)).collect();
             chain.want_whole();
             let started = Instant::now();

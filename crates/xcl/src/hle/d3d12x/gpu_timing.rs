@@ -47,6 +47,39 @@ thread_local! {
     static CAT_OPEN: Cell<bool> = const { Cell::new(false) };
 }
 
+/// The pipeline a scope ran: its console shaders' label (`dred::label`), the category, and whether
+/// it is a split program (its pieces or its whole form).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct PipeKey {
+    label: String,
+    cat: usize,
+    split: bool,
+}
+
+/// pipeline → (microseconds, scopes) since the last `take_pipeline_lines`
+static PIPES: Mutex<Option<HashMap<PipeKey, (u64, u64)>>> = Mutex::new(None);
+
+/// The `top` costliest pipelines since the last call, then what the others took together.
+pub fn take_pipeline_lines(top: usize) -> Vec<String> {
+    let map = PIPES.lock().unwrap().take().unwrap_or_default();
+    pipeline_lines(map, top)
+}
+
+fn pipeline_lines(map: HashMap<PipeKey, (u64, u64)>, top: usize) -> Vec<String> {
+    let mut all: Vec<_> = map.into_iter().collect();
+    all.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then_with(|| a.0.label.cmp(&b.0.label)));
+    let rest = all.split_off(top.min(all.len()));
+    let mut out: Vec<String> = all
+        .iter()
+        .map(|(k, (us, n))| format!("us={us} n={n} cat={} split={} {}", CAT_NAMES[k.cat], u8::from(k.split), k.label))
+        .collect();
+    if !rest.is_empty() {
+        let (us, n) = rest.iter().fold((0, 0), |t, (_, v)| (t.0 + v.0, t.1 + v.1));
+        out.push(format!("us={us} n={n} others={}", rest.len()));
+    }
+    out
+}
+
 /// `name=ms (scopes)` per category, and the scopes left untimed
 pub fn cat_line() -> String {
     let mut out = String::new();
@@ -87,7 +120,7 @@ struct Slot {
     end: ID3D12GraphicsCommandList,
     val: u64,
     lists: usize,
-    cat_slots: Vec<(usize, Cat)>,
+    cat_slots: Vec<Timed>,
     in_flight: bool,
 }
 
@@ -95,7 +128,17 @@ struct CatPool {
     heap: ID3D12QueryHeap,
     readback: ID3D12Resource,
     free: Vec<usize>,
-    list_pending: HashMap<usize, Vec<(usize, Cat)>>,
+    list_pending: HashMap<usize, Vec<Timed>>,
+}
+
+/// A recorded scope: its query pair, category, and pipeline (0: none, as for copies and clears)
+/// with whether that is a split program
+#[derive(Clone, Copy)]
+struct Timed {
+    slot: usize,
+    cat: Cat,
+    pso: usize,
+    split: bool,
 }
 
 static CAT_POOL: Mutex<Option<CatPool>> = Mutex::new(None);
@@ -150,8 +193,7 @@ impl CatPool {
 
 pub struct CatScope {
     list: usize,
-    slot: usize,
-    cat: Cat,
+    timed: Timed,
     heap: ID3D12QueryHeap,
     readback: ID3D12Resource,
 }
@@ -169,6 +211,11 @@ impl CatScope {
         if !enabled() || CAT_OPEN.get() || list.GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT {
             return None;
         }
+        let pso = match cat {
+            Cat::Copy | Cat::Clear => 0,
+            _ => super::bind::bound_pso(list.as_raw()),
+        };
+        let split = pso != 0 && (super::real::dispatch_chain::is_chain(pso) || super::real::dispatch_chain::is_chain(super::pso_async::resolve(pso)));
         let mut guard = CAT_POOL.lock().unwrap();
         if guard.is_none() {
             let mut dev: Option<ID3D12Device> = None;
@@ -187,8 +234,7 @@ impl CatScope {
         CAT_OPEN.set(true);
         Some(Self {
             list: list.as_raw() as usize,
-            slot,
-            cat,
+            timed: Timed { slot, cat, pso, split },
             heap,
             readback,
         })
@@ -208,16 +254,16 @@ impl Drop for CatScope {
         unsafe {
             let raw = self.list as *mut c_void;
             if let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&raw) {
-                let q0 = (self.slot * 2) as u32;
+                let q0 = (self.timed.slot * 2) as u32;
                 list.EndQuery(&self.heap, D3D12_QUERY_TYPE_TIMESTAMP, q0 + 1);
-                list.ResolveQueryData(&self.heap, D3D12_QUERY_TYPE_TIMESTAMP, q0, 2, &self.readback, (self.slot * 16) as u64);
+                list.ResolveQueryData(&self.heap, D3D12_QUERY_TYPE_TIMESTAMP, q0, 2, &self.readback, (self.timed.slot * 16) as u64);
                 if let Some(pool) = CAT_POOL.lock().unwrap().as_mut() {
-                    pool.list_pending.entry(self.list).or_default().push((self.slot, self.cat));
+                    pool.list_pending.entry(self.list).or_default().push(self.timed);
                     return;
                 }
             }
             if let Some(pool) = CAT_POOL.lock().unwrap().as_mut() {
-                pool.free.push(self.slot);
+                pool.free.push(self.timed.slot);
             }
         }
     }
@@ -229,12 +275,12 @@ pub fn cat_drop_list(list_raw: usize) {
     }
     if let Some(pool) = CAT_POOL.lock().unwrap().as_mut() {
         if let Some(gone) = pool.list_pending.remove(&list_raw) {
-            pool.free.extend(gone.into_iter().map(|(s, _)| s));
+            pool.free.extend(gone.into_iter().map(|t| t.slot));
         }
     }
 }
 
-fn cat_take_lists(chunk: &[*mut c_void]) -> Vec<(usize, Cat)> {
+fn cat_take_lists(chunk: &[*mut c_void]) -> Vec<Timed> {
     let mut guard = CAT_POOL.lock().unwrap();
     let Some(pool) = guard.as_mut() else { return Vec::new() };
     let mut out = Vec::new();
@@ -246,7 +292,7 @@ fn cat_take_lists(chunk: &[*mut c_void]) -> Vec<(usize, Cat)> {
     out
 }
 
-unsafe fn cat_resolve_and_free(slots: &[(usize, Cat)], freq: u64) {
+unsafe fn cat_resolve_and_free(slots: &[Timed], freq: u64) {
     if slots.is_empty() {
         return;
     }
@@ -262,16 +308,26 @@ unsafe fn cat_resolve_and_free(slots: &[(usize, Cat)], freq: u64) {
         };
         if rb.Map(0, Some(&range), Some(&mut ptr)).is_ok() {
             let samples = std::slice::from_raw_parts(ptr as *const u64, CAT_SLOTS * 2);
-            for &(s, cat) in slots {
+            let mut pipes = PIPES.lock().unwrap();
+            let pipes = pipes.get_or_insert_with(HashMap::new);
+            for &Timed { slot: s, cat, pso, split } in slots {
                 let us = ticks_to_micros(samples[s * 2], samples[s * 2 + 1], freq);
                 CAT_US[cat as usize].fetch_add(us, Ordering::Relaxed);
                 CAT_COUNT[cat as usize].fetch_add(1, Ordering::Relaxed);
+                if pso != 0 {
+                    let label = super::dred::label_of(pso)
+                        .or_else(|| super::dred::label_of(super::pso_async::resolve(pso)))
+                        .unwrap_or_else(|| format!("pso {pso:#x}"));
+                    let total = pipes.entry(PipeKey { label, cat: cat as usize, split }).or_default();
+                    total.0 += us;
+                    total.1 += 1;
+                }
             }
             rb.Unmap(0, Some(&D3D12_RANGE::default()));
         }
     }
     if let Some(pool) = CAT_POOL.lock().unwrap().as_mut() {
-        pool.free.extend(slots.iter().map(|&(s, _)| s));
+        pool.free.extend(slots.iter().map(|t| t.slot));
     }
 }
 
@@ -473,6 +529,22 @@ pub unsafe fn wrap_submit(queue_raw: *mut c_void, chunk: &[*mut c_void], submit:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pipeline_lines_are_the_costliest_first_and_the_rest_summed() {
+        let key = |label: &str, cat: Cat, split| PipeKey { label: label.into(), cat: cat as usize, split };
+        let map = HashMap::from([
+            (key("cs b", Cat::Dispatch, false), (10, 1)),
+            (key("cs a", Cat::Chain, true), (500, 3)),
+            (key("ms c ps d", Cat::TwoPass, false), (40, 2)),
+            (key("cs e", Cat::IndirectDispatch, false), (5, 4)),
+        ]);
+        assert_eq!(
+            pipeline_lines(map, 2),
+            ["us=500 n=3 cat=chain split=1 cs a", "us=40 n=2 cat=two_pass split=0 ms c ps d", "us=15 n=5 others=2"]
+        );
+        assert!(pipeline_lines(HashMap::new(), 2).is_empty());
+    }
 
     #[test]
     fn ticks_to_micros_computes_exact_duration() {

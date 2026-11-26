@@ -222,6 +222,11 @@ fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
     f(STATES.lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default())
 }
 
+/// The title's pipeline bound on `list` (0: none)
+pub(super) fn bound_pso(list: *mut c_void) -> usize {
+    with(list, |s| s.pso)
+}
+
 /// The list was created or reset onto `allocator` with `initial_pso`: the previous
 /// recording's memory is the previous allocator's until that one is reset, and pipeline
 /// and root signature state reset per D3D12 `CreateCommandList` / `Reset` semantics.

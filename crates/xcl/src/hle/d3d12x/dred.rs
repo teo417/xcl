@@ -39,14 +39,19 @@ pub fn on() -> bool {
 
 /// Name a translated pipeline by its console shaders (`("ms", bytes)`, …).
 pub fn label(pso: usize, shaders: &[(&str, Option<&[u8]>)]) {
-    if !on() || pso == 0 {
+    if !labelling() || pso == 0 {
         return;
     }
     let text = shaders.iter().filter_map(|(k, b)| b.map(|b| format!("{k} {:016x}", crate::gpu::shader::fnv64(b)))).collect::<Vec<_>>().join(" ");
     LABELS.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, text);
 }
 
-fn label_of(pso: usize) -> Option<String> {
+/// DRED's markers and `XCL_GPU_TIMING`'s per-pipeline times both name pipelines.
+fn labelling() -> bool {
+    on() || super::gpu_timing::enabled()
+}
+
+pub(super) fn label_of(pso: usize) -> Option<String> {
     LABELS.lock().unwrap().as_ref()?.get(&pso).cloned()
 }
 
@@ -111,7 +116,7 @@ pub fn forget_list(list: *mut c_void) {
 
 /// A pipeline was released: its address may be another pipeline's next.
 pub fn forget_pso(pso: usize) {
-    if on() {
+    if labelling() {
         if let Some(m) = LABELS.lock().unwrap().as_mut() {
             m.remove(&pso);
         }

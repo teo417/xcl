@@ -117,6 +117,9 @@ pub fn host_main(boot_path: &Path) -> i32 {
                         gt[4]
                     );
                     crate::xlog_info!("gpu-cats (total ms): {}", crate::hle::d3d12x::gpu_timing::cat_line());
+                    for line in crate::hle::d3d12x::gpu_timing::take_pipeline_lines(80) {
+                        crate::xlog_info!("gpu-pso (window): {line}");
+                    }
                 }
                 let pso = crate::hle::d3d12x::pso_async::activity();
                 let pso_active = pso[1].saturating_sub(pso[2] + pso[3]);

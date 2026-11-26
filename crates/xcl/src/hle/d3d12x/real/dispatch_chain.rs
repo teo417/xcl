@@ -112,14 +112,17 @@ impl Chain {
     /// The whole form built on another thread, for a later ExecuteIndirect with more slabs than rounds
     fn want_whole(self: &Arc<Self>) {
         if !self.wanted.swap(true, Ordering::Relaxed) {
-            let chain = self.clone();
-            whole_thread().spawn(move || unsafe {
+            let len = self.whole_code.len();
+            let lane = if len >= GIANT_DRIVER_COMPILE { 2 } else if len >= huge_pso_bytes() { 1 } else { 0 };
+            WHOLE_BUILDS[lane].push(Arc::downgrade(self), |chain| unsafe {
+                // (a program released before its turn is not built)
+                let Some(chain) = chain.upgrade() else { return };
                 let waited = chain.clone();
                 let built = super::super::pso_async::build_waited_on(move || waited.waiting.load(Ordering::Acquire) > 0, || {
                     if chain.whole.get().is_some() { Ok(()) } else { chain.build_whole_form().map(drop) }
                 });
                 if let Err(e) = built { crate::xlog_warn!("D3D12.X: whole form of a split program: {e}"); }
-            }).ok();
+            });
         }
     }
 }
@@ -129,6 +132,44 @@ impl Chain {
 fn whole_thread() -> std::thread::Builder {
     std::thread::Builder::new().name("xcl-pso-chain-whole".into())
 }
+
+/// Work done one item after another on one thread of `whole_thread`'s, started when there is
+/// some and none is running.
+struct InTurn<T> {
+    queue: Mutex<(std::collections::VecDeque<T>, bool)>,
+    /// threads started so far
+    started: AtomicU64,
+}
+
+impl<T: Send + 'static> InTurn<T> {
+    const fn new() -> Self {
+        Self { queue: Mutex::new((std::collections::VecDeque::new(), false)), started: AtomicU64::new(0) }
+    }
+
+    fn push(&'static self, item: T, run: fn(T)) {
+        let mut q = self.queue.lock().unwrap();
+        q.0.push_back(item);
+        if std::mem::replace(&mut q.1, true) { return; }
+        drop(q);
+        self.started.fetch_add(1, Ordering::Relaxed);
+        let spawned = whole_thread().spawn(move || loop {
+            let next = {
+                let mut q = self.queue.lock().unwrap();
+                let next = q.0.pop_front();
+                q.1 = next.is_some();
+                next
+            };
+            match next { Some(item) => run(item), None => return }
+        });
+        // (the next push tries again)
+        if spawned.is_err() { self.queue.lock().unwrap().1 = false; }
+    }
+}
+
+/// The whole forms `want_whole` asked for, one lane for each slot set of `driver_compile` (small
+/// ones are never gated, huge and giant ones take their turns): a thread of their own for each
+/// would wait for its turn as well, and a title had 200 such threads, 199 of them waiting (#2404).
+static WHOLE_BUILDS: [InTurn<std::sync::Weak<Chain>>; 3] = [InTurn::new(), InTurn::new(), InTurn::new()];
 
 static CHAINS: LazyLock<Mutex<HashMap<usize, Arc<Chain>>>> = LazyLock::new(Default::default);
 
@@ -795,6 +836,38 @@ mod tests {
     /// A title thread that needs the whole form while `want_whole`'s build of it waits for its
     /// turn (`big_compile_turn`, every background slot taken) does not wait behind that turn: the
     /// build is then one the title waits for, with the wanted cap and no commit wait (#2404)
+    #[test]
+    fn whole_forms_wanted_together_are_built_one_after_another_on_one_thread() {
+        use super::InTurn;
+        use std::sync::{atomic::Ordering, Mutex};
+        static TURNS: InTurn<u32> = InTurn::new();
+        static GATE: Mutex<()> = Mutex::new(());
+        static RAN: Mutex<Vec<(u32, Option<String>)>> = Mutex::new(Vec::new());
+        let gate = GATE.lock().unwrap();
+        for i in 0..5 {
+            TURNS.push(i, |i| {
+                drop(GATE.lock().unwrap());
+                RAN.lock().unwrap().push((i, std::thread::current().name().map(String::from)));
+            });
+        }
+        let started = TURNS.started.load(Ordering::Relaxed);
+        drop(gate);
+        let t = std::time::Instant::now();
+        while RAN.lock().unwrap().len() < 5 && t.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let ran = RAN.lock().unwrap().clone();
+        assert_eq!(started, 1, "a thread for each of 5 whole forms");
+        assert_eq!(ran, (0..5).map(|i| (i, Some("xcl-pso-chain-whole".to_string()))).collect::<Vec<_>>());
+        // the thread ends with the queue; the next one starts another
+        let t = std::time::Instant::now();
+        while TURNS.queue.lock().unwrap().1 && t.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        TURNS.push(5, |i| RAN.lock().unwrap().push((i, None)));
+        assert_eq!(TURNS.started.load(Ordering::Relaxed), 2);
+    }
+
     #[test]
     fn a_title_thread_does_not_wait_behind_a_background_whole_build_waiting_for_its_turn() {
         use super::*;

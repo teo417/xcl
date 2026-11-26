@@ -999,7 +999,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             count(if gfx { DRAWS } else { DISPATCHES });
             let cat = if gfx { super::gpu_timing::Cat::IndirectDraw } else { super::gpu_timing::Cat::IndirectDispatch };
             let _cat = super::gpu_timing::CatScope::begin(list, cat);
-            let _crumb = super::crumbs::begin(list, pso);
+            let at = super::real::console_buffer(args)
+                .filter(|&(_, size)| args_off_title as usize + 12 <= size)
+                .map_or(0, |(p, _)| p + args_off_title as usize);
+            let _crumb = super::crumbs::begin(list, pso, super::crumbs::Groups::Indirect(at));
             fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off))
         }
         Err(e) => {
@@ -1042,7 +1045,10 @@ unsafe fn chained_indirect(this: *mut c_void, list: &ID3D12GraphicsCommandList, 
     } else {
         None
     };
-    let _crumb = super::crumbs::begin(list, pso);
+    let at = super::real::console_buffer(args)
+        .filter(|&(_, size)| args_title as usize + 12 <= size)
+        .map_or(0, |(p, _)| p + args_title as usize);
+    let _crumb = super::crumbs::begin(list, pso, super::crumbs::Groups::Indirect(at));
     super::real::dispatch_chain::execute_indirect(list, pso, with(this, |s| s.allocator), args_va, stride, max, count_va, &seen,
         super::list_x::predicated(this), || bind_abi(this, list, pso, false))
 }
@@ -1719,7 +1725,7 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
         super::gpu_timing::Cat::Dispatch
     };
     let _cat = super::gpu_timing::CatScope::begin(list, cat);
-    let _crumb = super::crumbs::begin(list, pso);
+    let _crumb = super::crumbs::begin(list, pso, super::crumbs::Groups::Direct([x, y, z]));
     super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), [x, y, z])
 }
 

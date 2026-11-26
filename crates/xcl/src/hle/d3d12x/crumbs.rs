@@ -12,6 +12,32 @@ use std::sync::{Mutex, OnceLock};
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
 
+/// How many groups a dispatch was given.
+#[derive(Clone, Copy, Default)]
+pub enum Groups {
+    /// a direct dispatch's x, y, z
+    Direct([u32; 3]),
+    /// an indirect one: where the title's memory holds the arguments (0: not CPU-visible),
+    /// read again at the report
+    Indirect(usize),
+    #[default]
+    Unknown,
+}
+
+impl Groups {
+    unsafe fn text(self) -> String {
+        match self {
+            Groups::Direct([x, y, z]) => format!("groups {x}x{y}x{z}"),
+            Groups::Indirect(at) if at != 0 && crate::gpu::shader::readable(at, 12) => {
+                let v = std::ptr::read_volatile(at as *const [u32; 3]);
+                format!("indirect, arguments now {}x{}x{}", v[0], v[1], v[2])
+            }
+            Groups::Indirect(_) => "indirect, arguments not CPU-visible".into(),
+            Groups::Unknown => "groups unknown".into(),
+        }
+    }
+}
+
 /// Dispatches remembered; a stalled GPU is a few frames (some thousand dispatches) behind.
 const ENTRIES: usize = 1 << 18;
 /// In-flight dispatches named in one report.
@@ -24,6 +50,7 @@ struct Crumbs {
     next: u32,
     /// (number, list, pipeline) per entry
     meta: Vec<(u32, usize, usize)>,
+    groups: Vec<Groups>,
 }
 
 static CRUMBS: Mutex<Option<Crumbs>> = Mutex::new(None);
@@ -64,11 +91,11 @@ unsafe fn make(list: &ID3D12GraphicsCommandList) -> Option<Crumbs> {
     let buffer = buffer?;
     let mut at: *mut c_void = std::ptr::null_mut();
     buffer.Map(0, None, Some(&mut at)).ok()?;
-    Some(Crumbs { buffer, at: at as usize, next: 0, meta: vec![(0, 0, 0); ENTRIES] })
+    Some(Crumbs { buffer, at: at as usize, next: 0, meta: vec![(0, 0, 0); ENTRIES], groups: vec![Groups::Unknown; ENTRIES] })
 }
 
 /// Before a dispatch of `pso` is recorded on `list`; the guard marks its end.
-pub unsafe fn begin(list: &ID3D12GraphicsCommandList, pso: usize) -> Option<Crumb> {
+pub unsafe fn begin(list: &ID3D12GraphicsCommandList, pso: usize, groups: Groups) -> Option<Crumb> {
     if !on() || list.GetType() != D3D12_COMMAND_LIST_TYPE_COMPUTE {
         return None;
     }
@@ -83,6 +110,7 @@ pub unsafe fn begin(list: &ID3D12GraphicsCommandList, pso: usize) -> Option<Crum
         let number = c.next;
         let k = number as usize % ENTRIES;
         c.meta[k] = (number, list.as_raw() as usize, pso);
+        c.groups[k] = groups;
         (c.buffer.GetGPUVirtualAddress() + (k * 8) as u64, number)
     };
     mark(&list2, address, number, D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN);
@@ -127,7 +155,8 @@ pub fn report() -> Vec<String> {
             .or_else(|| super::dred::label_of(super::pso_async::resolve(pso)))
             .unwrap_or_else(|| "unlabelled (XCL_DRED=1 names them)".into());
         let split = super::real::dispatch_chain::is_chain(pso) || super::real::dispatch_chain::is_chain(super::pso_async::resolve(pso));
-        out.push(format!("dispatch #{number} on list {list:#x}, pipeline {pso:#x}{}: {label}", if split { " (split program)" } else { "" }));
+        let groups = unsafe { c.groups[number as usize % ENTRIES].text() };
+        out.push(format!("dispatch #{number} on list {list:#x}, pipeline {pso:#x}{}, {groups}: {label}", if split { " (split program)" } else { "" }));
     }
     out
 }

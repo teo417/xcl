@@ -4046,7 +4046,7 @@ fn driver_compile<R>(kind: &str, bytes: usize, gate: bool, build: impl FnOnce() 
 }
 
 /// `XCL_PSO_TRACE=1`: every driver compile is logged, not only huge ones.
-fn pso_trace() -> bool {
+pub(super) fn pso_trace() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("XCL_PSO_TRACE").is_ok_and(|v| v.trim() == "1"))
 }
@@ -4068,6 +4068,7 @@ fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Op
         });
         crate::xlog_info!("D3D12.X: driver compile start #{sequence}: {kind} PSO, {bytes} B DXIL{record}");
     }
+    super::pso_async::note_driver_phase();
     let started = std::time::Instant::now();
     let r = build();
     let took = started.elapsed();

@@ -150,25 +150,54 @@ fn shader_cache() -> &'static Mutex<ShaderCache> {
     CACHE.get_or_init(|| Mutex::new(ShaderCache::new(64 << 20)))
 }
 
+fn pso_trace() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("XCL_PSO_TRACE").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// `console_to_dxil_for` with the title's memory windows given (`xcl shaders --precompile`
 /// fills the caches without a title: the same keys as at its run).
 pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
+    let started = std::time::Instant::now();
+    let hash = crate::gpu::shader::fnv64(blob);
     let compile_one = || compile_console_shader(blob, stage, sampler_base, windows, split_wave64);
-    if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
-        return compile_one().map(|(c, _)| c);
-    }
-    let key = ShaderKey {
-        hash: crate::gpu::shader::fnv64(blob),
-        stage,
-        sampler_base,
-        windows,
-        split_wave64,
-        cache_dir: dxc::cache_dir(),
+    let res = if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
+        compile_one().map(|(c, _)| c)
+    } else {
+        let key = ShaderKey {
+            hash,
+            stage,
+            sampler_base,
+            windows,
+            split_wave64,
+            cache_dir: dxc::cache_dir(),
+        };
+        // with `XCL_DIRECT_DXIL` the disk entries live under their own identity (backend tag,
+        // direct translator version, routing mode): never mixed with the HLSL path's entries
+        let from_disk = || translated::cached(&dxc::cache_dir(), blob, stage, sampler_base, windows, split_wave64, compile_one);
+        cached_shader(shader_cache(), key, blob, from_disk).map(|shader| shader.as_ref().clone())
     };
-    // with `XCL_DIRECT_DXIL` the disk entries live under their own identity (backend tag,
-    // direct translator version, routing mode): never mixed with the HLSL path's entries
-    let from_disk = || translated::cached(&dxc::cache_dir(), blob, stage, sampler_base, windows, split_wave64, compile_one);
-    cached_shader(shader_cache(), key, blob, from_disk).map(|shader| shader.as_ref().clone())
+    let took = started.elapsed();
+    if pso_trace() || took >= std::time::Duration::from_millis(500) {
+        match &res {
+            Ok(c) => crate::xlog_info!(
+                "D3D12.X: translate {:?} shader {:016x} ({} B) took {} ms (dxil={} B)",
+                stage,
+                hash,
+                blob.len(),
+                took.as_millis(),
+                c.dxil.len()
+            ),
+            Err(e) => crate::xlog_info!(
+                "D3D12.X: translate {:?} shader {:016x} ({} B) failed in {} ms ({e})",
+                stage,
+                hash,
+                blob.len(),
+                took.as_millis()
+            ),
+        }
+    }
+    res
 }
 
 /// Translations on disk: a console program's (DXIL, static samplers) by its bytes, so a run

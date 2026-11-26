@@ -84,6 +84,17 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     mb(pools as u64),
                     mb(pools_mapped as u64)
                 );
+                let pso = crate::hle::d3d12x::pso_async::activity();
+                let pso_active = pso[1].saturating_sub(pso[2] + pso[3]);
+                crate::xlog_info!(
+                    "pso (total): {} submitted, {} started ({} active), {} built, {} failed, {} title_held",
+                    pso[0],
+                    pso[1],
+                    pso_active,
+                    pso[2],
+                    pso[3],
+                    pso[4]
+                );
                 last = now;
             }
         });

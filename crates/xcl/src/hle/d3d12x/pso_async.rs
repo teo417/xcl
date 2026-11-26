@@ -8,8 +8,13 @@
 //! `XCL_ASYNC_PSO=0` builds every pipeline in the call, as before.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+
+const PHASE_QUEUED: u8 = 0;
+const PHASE_TRANSLATING: u8 = 1;
+const PHASE_DRIVER: u8 = 2;
+const PHASE_DONE: u8 = 3;
 
 struct Pending {
     /// the build, until a worker – or a bind that cannot wait for the queue – takes it
@@ -33,6 +38,7 @@ struct Pending {
     late: std::sync::atomic::AtomicBool,
     /// its dispatches may be left out while it is built (`image_only`): binds do not wait for it
     spared: std::sync::atomic::AtomicBool,
+    phase: AtomicU8,
     demand: Mutex<Demand>,
 }
 
@@ -71,6 +77,7 @@ pub fn wanted_here() -> crate::gpu::recomp::dxc::Wanted {
 /// A worker's build of `p` (`preload`: by one of the lowest-priority workers).
 fn build(p: &Arc<Pending>, job: Job, preload: bool) {
     use windows_sys::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL};
+    p.phase.store(PHASE_TRANSLATING, Ordering::Release);
     BUILDING.with(|b| *b.borrow_mut() = Some(p.clone()));
     if preload {
         let mut d = p.demand.lock().unwrap();
@@ -91,7 +98,23 @@ fn build(p: &Arc<Pending>, job: Job, preload: bool) {
     BUILDING.with(|b| *b.borrow_mut() = None);
 }
 
+pub(super) fn note_driver_phase() {
+    BUILDING.with(|b| {
+        if let Some(p) = b.borrow().as_ref() {
+            p.phase.store(PHASE_DRIVER, Ordering::Release);
+        }
+    });
+}
+
 impl Pending {
+    fn phase_name(&self) -> &'static str {
+        match self.phase.load(Ordering::Acquire) {
+            PHASE_QUEUED => "queued",
+            PHASE_TRANSLATING => "translating",
+            PHASE_DRIVER => "driver",
+            _ => "done",
+        }
+    }
     /// One of the title's threads is about to wait for it: the worker building it goes on now,
     /// at a normal priority.
     fn want(&self) {
@@ -121,6 +144,7 @@ static PENDING: Mutex<Option<HashMap<usize, Arc<Pending>>>> = Mutex::new(None);
 
 /// The build is done (`real`: its pipeline, 0 = failed).
 fn complete(p: &Pending, real: usize) {
+    p.phase.store(PHASE_DONE, Ordering::Release);
     if real == 0 {
         FAILED.fetch_add(1, Ordering::Relaxed);
     } else {
@@ -141,6 +165,8 @@ fn complete(p: &Pending, real: usize) {
         release(real);
     }
 }
+static SUBMITTED: AtomicUsize = AtomicUsize::new(0);
+static STARTED_BUILDS: AtomicUsize = AtomicUsize::new(0);
 static BUILT: AtomicUsize = AtomicUsize::new(0);
 static FAILED: AtomicUsize = AtomicUsize::new(0);
 /// binds waiting right now for a pipeline still being built (`title_held`)
@@ -326,6 +352,7 @@ fn build_queued(p: &Arc<Pending>) {
     // (None: a bind took it and builds it itself)
     let job = p.job.lock().unwrap().take();
     if let Some(job) = job {
+        STARTED_BUILDS.fetch_add(1, Ordering::Relaxed);
         build(p, job, false);
     }
 }
@@ -386,6 +413,7 @@ pub fn submit_lazy(standin: usize, compute: bool, job: Job, key: u64) {
 }
 
 fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
+    SUBMITTED.fetch_add(1, Ordering::Relaxed);
     let p = Arc::new(Pending {
         job: Mutex::new(Some(job)),
         sent: std::sync::atomic::AtomicBool::new(send),
@@ -399,6 +427,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         orphan: Default::default(),
         late: Default::default(),
         spared: Default::default(),
+        phase: AtomicU8::new(PHASE_QUEUED),
         demand: Default::default(),
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
@@ -543,6 +572,7 @@ fn preload() -> Option<&'static Preload> {
                     // (None: a bind took it and builds it itself)
                     let job = p.job.lock().unwrap().take();
                     if let Some(job) = job {
+                        STARTED_BUILDS.fetch_add(1, Ordering::Relaxed);
                         build(&p, job, true);
                         let n = DONE.fetch_add(1, Ordering::Relaxed) + 1;
                         if n.is_power_of_two() {
@@ -1159,21 +1189,44 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     if p.spared.load(Ordering::Acquire) {
         return resolve_spared(&p, pso);
     }
+    let was_done = *p.done.lock().unwrap();
+    let entry_phase = p.phase_name();
+    let wait_started = (!was_done).then(std::time::Instant::now);
     // (the title's thread is held from here until the pipeline is built or the budget is over)
-    let _held = (!*p.done.lock().unwrap()).then(Held::new);
+    let _held = (!was_done).then(Held::new);
     if let Some(budget) = budget {
         return resolve_within(&p, pso, budget);
     }
     let job = p.job.lock().unwrap().take();
+    let inline = job.is_some();
     if let Some(job) = job {
+        STARTED_BUILDS.fetch_add(1, Ordering::Relaxed);
+        p.phase.store(PHASE_TRANSLATING, Ordering::Release);
+        BUILDING.with(|b| *b.borrow_mut() = Some(p.clone()));
         complete(&p, job());
+        BUILDING.with(|b| *b.borrow_mut() = None);
     }
     p.want();
     let mut done = p.done.lock().unwrap();
     while !*done {
         done = p.cv.wait(done).unwrap();
     }
-    match p.real.load(Ordering::Acquire) {
+    let real = p.real.load(Ordering::Acquire);
+    if let Some(started) = wait_started {
+        let took = started.elapsed();
+        if super::real::pso_trace() || took >= std::time::Duration::from_millis(100) {
+            crate::xlog_info!(
+                "D3D12.X: resolve_wait {} PSO key={:016x} took {} ms (entry={}, inline={}, ok={})",
+                if p.compute { "compute" } else { "graphics" },
+                p.key,
+                took.as_millis(),
+                entry_phase,
+                inline,
+                real != 0
+            );
+        }
+    }
+    match real {
         0 => p.stand(pso),
         r => r,
     }
@@ -1314,4 +1367,44 @@ pub fn need_by_submit(pso: usize) {
 pub fn counts() -> (usize, usize, usize) {
     let pending = PENDING.lock().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| !*p.done.lock().unwrap()).count());
     (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), pending)
+}
+
+/// `[submitted, started, built, failed, held]` for `xcl-activity` 2 s heartbeat.
+pub fn activity() -> [usize; 5] {
+    [
+        SUBMITTED.load(Ordering::Relaxed),
+        STARTED_BUILDS.load(Ordering::Relaxed),
+        BUILT.load(Ordering::Relaxed),
+        FAILED.load(Ordering::Relaxed),
+        HELD.load(Ordering::Relaxed),
+    ]
+}
+
+#[cfg(test)]
+mod diag_tests {
+    use super::*;
+
+    #[test]
+    fn activity_and_resolve_wait_track_phases() {
+        let before = activity();
+        let standin = 0xDEAD_0001usize;
+        submit_lazy(
+            standin,
+            true,
+            Box::new(|| {
+                note_driver_phase();
+                0xBEEF_0001
+            }),
+            0x1234_5678,
+        );
+        let p = entry(standin).expect("pending entry");
+        assert_eq!(p.phase_name(), "queued");
+        assert_eq!(resolve_wait(standin), 0xBEEF_0001);
+        assert_eq!(p.phase_name(), "done");
+        let after = activity();
+        assert!(after[0] > before[0], "submitted incremented");
+        assert!(after[1] > before[1], "started incremented");
+        assert!(after[2] > before[2], "built incremented");
+        let _ = released(standin);
+    }
 }

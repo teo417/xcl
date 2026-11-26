@@ -199,6 +199,10 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
     Some(rs)
 }
 
+pub(in crate::hle::d3d12x) fn is_chain(pso: usize) -> bool {
+    CHAINS.lock().unwrap().contains_key(&pso)
+}
+
 pub(super) fn forget(pso: usize) {
     let gone = CHAINS.lock().unwrap().remove(&pso);
     drop(gone); // releasing a tail PSO also goes through forget_pso

@@ -829,6 +829,7 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
     // (of a list that was here before and whose release was not seen: the GPU may still use it)
     release_copy_scratch(key);
     real::dispatch_chain::list_reset(key);
+    super::gpu_timing::cat_drop_list(key);
     let old = {
         let mut g = LISTS.lock().unwrap();
         let m = g.get_or_insert_with(HashMap::new);
@@ -868,6 +869,7 @@ pub(super) fn on_release(list: usize) {
     super::alloc_pool::forget_list(list);
     release_copy_scratch(list);
     real::dispatch_chain::list_reset(list);
+    super::gpu_timing::cat_drop_list(list);
     super::title_textures::list_reset(list);
     let old = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&list));
     if let Some(old) = old {
@@ -4464,6 +4466,7 @@ pub(super) unsafe extern "system" fn copy_buffer_region_x(this: *mut c_void, dst
             note_gpu_write("CopyBufferRegion", a + dst_off as usize, n);
         }
     }
+    let _cat = super::gpu_timing::CatScope::begin_raw(this, super::gpu_timing::Cat::Copy);
     pc::<unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64)>(this, PC_COPY_BUFFER_REGION)(this, dst, dst_off + real::buffer_delta(dst), src, src_off + real::buffer_delta(src), n)
 }
 
@@ -4564,6 +4567,7 @@ pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, ds
         }
     }
     let (Some(d), Some(s)) = (pc_location(dst), pc_location(src)) else { return };
+    let _cat = super::gpu_timing::CatScope::begin_raw(this, super::gpu_timing::Cat::Copy);
     pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(this, PC_COPY_TEXTURE_REGION)(this, &d, x, y, z, &s, bx);
     std::mem::forget((d, s)); // borrowed resource pointers
 }
@@ -4698,6 +4702,7 @@ pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usi
     }
     let (dd, sd) = (real::buffer_delta(dst), real::buffer_delta(src));
     if dd == 0 && sd == 0 {
+        let _cat = super::gpu_timing::CatScope::begin_raw(this, super::gpu_timing::Cat::Copy);
         return pc::<unsafe extern "system" fn(*mut c_void, usize, usize)>(this, PC_COPY_RESOURCE)(this, dst, src);
     }
     let n = real::console_buffer(dst).or(real::console_buffer(src)).map_or(0, |b| b.1 as u64);

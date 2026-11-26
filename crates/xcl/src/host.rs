@@ -108,6 +108,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 );
                 if crate::hle::d3d12x::gpu_timing::enabled() {
                     let gt = crate::hle::d3d12x::gpu_timing::activity();
+                    let gc = crate::hle::d3d12x::gpu_timing::cat_activity();
                     crate::xlog_info!(
                         "gpu-timing (total): {} direct submits ({} lists), {} ms GPU time (max {} ms), {} untimed",
                         gt[0],
@@ -115,6 +116,14 @@ pub fn host_main(boot_path: &Path) -> i32 {
                         gt[2] / 1000,
                         gt[3] / 1000,
                         gt[4]
+                    );
+                    crate::xlog_info!(
+                        "gpu-cats (total ms): chain={} ({}), two_pass={} ({}), draw={} ({}), dispatch={} ({}), copy={} ({})",
+                        gc[0].0 / 1000, gc[0].1,
+                        gc[1].0 / 1000, gc[1].1,
+                        gc[2].0 / 1000, gc[2].1,
+                        gc[3].0 / 1000, gc[3].1,
+                        gc[4].0 / 1000, gc[4].1
                     );
                 }
                 let pso = crate::hle::d3d12x::pso_async::activity();

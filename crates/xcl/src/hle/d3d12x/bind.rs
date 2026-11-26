@@ -760,6 +760,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
         let need = (groups as u64).saturating_mul(record_bytes);
         let run = (|| -> Result<(), String> {
             let (res_buf, res_va, cap) = ensure_res_buffer(this, need)?;
+            let _cat = super::gpu_timing::CatScope::begin(list, super::gpu_timing::Cat::TwoPass);
             let n = groups.min(record_groups(cap, record_bytes, tp.mesh_groups_per_record));
             if n == 0 {
                 return Err(format!("a record of {record_bytes} B does not fit the record buffer"));
@@ -1025,6 +1026,11 @@ unsafe fn chained_indirect(this: *mut c_void, list: &ID3D12GraphicsCommandList, 
     };
     let n = if count_buf == 0 { max } else { read(count_buf, count_title, 1).map_or(max, |c| c[0].min(max)) };
     let seen: Vec<[u32; 3]> = (0..n.min(64)).filter_map(|k| read(args, args_title + u64::from(k * stride), 3)).map(|v| [v[0], v[1], v[2]]).collect();
+    let _cat = if super::real::dispatch_chain::is_chain(pso) {
+        super::gpu_timing::CatScope::begin(list, super::gpu_timing::Cat::Chain)
+    } else {
+        None
+    };
     super::real::dispatch_chain::execute_indirect(list, pso, with(this, |s| s.allocator), args_va, stride, max, count_va, &seen,
         super::list_x::predicated(this), || bind_abi(this, list, pso, false))
 }
@@ -1174,6 +1180,7 @@ pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices:
             return;
         }
         super::list_x::sync_title_buffers(this, None, first_vertex, vertices, if first_instance != 0 { instances.max(2) } else { instances });
+        let _cat = super::gpu_timing::CatScope::begin(&list, super::gpu_timing::Cat::Draw);
         list.DrawInstanced(vertices, instances, first_vertex, first_instance);
     }
 }
@@ -1212,6 +1219,7 @@ pub(super) unsafe fn emit_prepared_indexed_draw(
     base_vertex: i32,
     first_instance: u32,
 ) {
+    let _cat = super::gpu_timing::CatScope::begin(list, super::gpu_timing::Cat::Draw);
     list.DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance);
 }
 
@@ -1693,6 +1701,12 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
         trace_fullscreen(this, pso, [x, y, z]);
     }
     bind_abi(this, list, pso, false)?;
+    let cat = if super::real::dispatch_chain::is_chain(pso) {
+        super::gpu_timing::Cat::Chain
+    } else {
+        super::gpu_timing::Cat::Dispatch
+    };
+    let _cat = super::gpu_timing::CatScope::begin(list, cat);
     super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), [x, y, z])
 }
 

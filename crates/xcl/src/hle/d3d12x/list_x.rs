@@ -1698,18 +1698,24 @@ const QUEUE_STATE_CALLS: usize = 6;
 /// submission order (`q1: #7 wait cell 0x…>=0x2 (done 0x1) | #8 signal …`). A chain line names only
 /// where one wait ends; this shows what every queue is held at.
 unsafe fn queue_state(graph: &SyncGraph) -> Vec<String> {
+    // `done 0x1`, or `done 0x1, gpu 0x2` when the GPU is further than the title is told
+    let progress = |done: u64, fence: *mut c_void| {
+        let gpu = unsafe { real::fence_gpu_value(fence) };
+        if gpu == done { format!("done {done:#x}") } else { format!("done {done:#x}, gpu {gpu:#x}") }
+    };
     let mut calls: Vec<(usize, u64, String)> = Vec::new();
     for (&va, cell) in &graph.cells {
         if cell.armed_waits.is_empty() && cell.submitted_signals.is_empty() {
             continue;
         }
         let done = cell.fence.as_ref().map_or(0, |f| f.GetCompletedValue());
+        let at = cell.fence.as_ref().map_or_else(|| format!("done {done:#x}"), |f| progress(done, f.as_raw()));
         for aw in cell.armed_waits.iter().filter(|aw| aw.val > done) {
             let age = aw.armed_at.elapsed().as_millis();
-            calls.push((queue_id(aw.waiting_queue), aw.wait_seq, format!("wait cell {va:#x}>={:#x} (done {done:#x}, {age} ms)", aw.val)));
+            calls.push((queue_id(aw.waiting_queue), aw.wait_seq, format!("wait cell {va:#x}>={:#x} ({at}, {age} ms)", aw.val)));
         }
         for s in cell.submitted_signals.iter().filter(|s| s.val > done) {
-            calls.push((queue_id(s.queue), s.seq, format!("signal cell {va:#x}={:#x} (done {done:#x})", s.val)));
+            calls.push((queue_id(s.queue), s.seq, format!("signal cell {va:#x}={:#x} ({at})", s.val)));
         }
     }
     for (&raw, tf) in &graph.title_fences {
@@ -1718,11 +1724,12 @@ unsafe fn queue_state(graph: &SyncGraph) -> Vec<String> {
         }
         let p = raw as *mut c_void;
         let done = ID3D12Fence::from_raw_borrowed(&p).map_or(0, |f| f.GetCompletedValue());
+        let at = if p.is_null() { format!("done {done:#x}") } else { progress(done, p) };
         for &(val, queue, seq) in tf.waits.iter().filter(|w| w.0 > done) {
-            calls.push((queue_id(queue), seq, format!("wait fence {raw:#x}>={val:#x} (done {done:#x})")));
+            calls.push((queue_id(queue), seq, format!("wait fence {raw:#x}>={val:#x} ({at})")));
         }
         for s in tf.signals.iter().filter(|s| s.val > done) {
-            calls.push((queue_id(s.queue), s.seq, format!("signal fence {raw:#x}={:#x} (done {done:#x})", s.val)));
+            calls.push((queue_id(s.queue), s.seq, format!("signal fence {raw:#x}={:#x} ({at})", s.val)));
         }
     }
     calls.sort_by_key(|c| (c.0, c.1));
@@ -1880,6 +1887,10 @@ fn wake_sync_watchdog() {
                             for q in &state {
                                 crate::xlog_warn!("D3D12.X: GPU queue state: {q}");
                             }
+                            for line in super::crumbs::report() {
+                                crate::xlog_warn!("D3D12.X: GPU compute crumbs: {line}");
+                            }
+                            real::remove_stalled_device();
                         }
                     }
                 }

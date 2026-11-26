@@ -7550,6 +7550,18 @@ unsafe extern "system" fn fence_get_completed_value(this: *mut c_void) -> u64 {
     completed_for_title(v, settled, landed)
 }
 
+/// Where the GPU has `fence`: its value without what `fence_get_completed_value` holds back from
+/// the title while copies back have not landed (diagnostics of the GPU's own ordering).
+pub(super) unsafe fn fence_gpu_value(fence: *mut c_void) -> u64 {
+    type F = unsafe extern "system" fn(*mut c_void) -> u64;
+    if is_adopted(fence) {
+        let f: F = std::mem::transmute(orig_fn(fence, slot_of(fence, "GetCompletedValue")));
+        return f(fence);
+    }
+    let f: F = std::mem::transmute(*(*(fence as *const *const usize)).add(8));
+    f(fence)
+}
+
 /// A `fence_set_event_on_completion` wait: the title's event, XCL's own event the fence sets, and
 /// the thread-pool wait on it (0 until registered)
 struct FenceWait {
@@ -7795,7 +7807,19 @@ pub fn log_device_removed() {
             let window = uma_window_vas().iter().position(|&w| va >= w && va < w + 0x1_0000_0000).map(|k| format!(" = window {k} + {:#x}", va - uma_window_vas()[k])).unwrap_or_default();
             crate::xlog_error!("DRED page fault at GPU VA {va:#x}{window}; allocations there: [{}]; recently freed: [{}]", names(pf.pHeadExistingAllocationNode), names(pf.pHeadRecentFreedAllocationNode));
         }
-        if let Ok(bc) = dred.GetAutoBreadcrumbsOutput() {
+        let breadcrumbs = dred.GetAutoBreadcrumbsOutput();
+        match &breadcrumbs {
+            Ok(bc) => {
+                let (mut all, mut unfinished) = (0usize, 0usize);
+                for n in std::iter::successors(bc.pHeadAutoBreadcrumbNode.as_ref(), |n| n.pNext.as_ref()).take(65536) {
+                    all += 1;
+                    unfinished += usize::from(n.pLastBreadcrumbValue.as_ref().is_some_and(|&v| v < n.BreadcrumbCount));
+                }
+                crate::xlog_error!("DRED: {all} command list(s) in the breadcrumbs, {unfinished} unfinished");
+            }
+            Err(e) => crate::xlog_error!("DRED: no breadcrumbs ({e})"),
+        }
+        if let Ok(bc) = breadcrumbs {
             report_dred_lists(bc.pHeadAutoBreadcrumbNode, |node, done| {
                 let count = node.BreadcrumbCount as usize;
                 let ops: Vec<String> = (done.saturating_sub(3)..(done + 3).min(count)).map(|i| format!("{}{}", if i == done { ">" } else { "" }, (*node.pCommandHistory.add(i)).0)).collect();
@@ -7811,6 +7835,24 @@ pub fn log_device_removed() {
                 crate::xlog_error!("DRED: list {:p} on queue {:p}: {done} of {count} operations done, around: {}{bound}", list, node.pCommandQueue.as_ref().map_or(std::ptr::null_mut(), |q| q.as_raw()), ops.join(" "));
             });
         }
+    }
+}
+
+/// `XCL_GPU_STALL_REMOVE=1` (with `XCL_DRED=1`): a stalled GPU that raises no TDR of its own has
+/// its device removed, so that DRED says where each command list stopped and which pipeline it had.
+pub(super) fn remove_stalled_device() {
+    if std::env::var_os("XCL_GPU_STALL_REMOVE").is_none() {
+        return;
+    }
+    let raw = device_raw();
+    let Some(dev) = (unsafe { ID3D12Device::from_raw_borrowed(&raw) }) else { return };
+    match dev.cast::<ID3D12Device5>() {
+        Ok(d) => {
+            crate::xlog_warn!("D3D12.X: XCL_GPU_STALL_REMOVE: removing the stalled device");
+            unsafe { d.RemoveDevice() };
+            stop_if_device_removed();
+        }
+        Err(e) => crate::xlog_warn!("D3D12.X: XCL_GPU_STALL_REMOVE: no ID3D12Device5 ({e})"),
     }
 }
 

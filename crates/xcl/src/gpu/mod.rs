@@ -8,6 +8,7 @@ pub mod desc;
 pub mod dxbc;
 pub mod dxil;
 pub mod effects;
+pub mod nvprofile;
 pub(crate) mod fence;
 pub mod pack;
 pub mod rdna2;

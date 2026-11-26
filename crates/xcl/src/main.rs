@@ -48,6 +48,10 @@ Usage:
       Lists or extracts readable inline records. Archives larger than 1 GB use a
       bounded-memory header probe; --probe requests it explicitly and --full overrides it.
       Use --probe only for header summaries, without --find, --extract, --out or --full.
+  xcl nvprofile [status | install [--mb N] | remove]
+      NVIDIA only: the driver profile of xcl.exe. `install` raises the shader heap the driver
+      reserves for pipelines in use (512 MB by default, a removed device past it, #2403) to
+      N MB (1024); it needs an elevated prompt once. `remove` takes XCL's profile out again.
   xcl --version
 ";
 
@@ -75,6 +79,7 @@ fn main() {
         }
         Some("disasm") if args.len() >= 2 => xcl::disasm::run(&PathBuf::from(&args[1]), &args[2..]),
         Some("shaders") if args.len() >= 2 => xcl::shaders::run(&PathBuf::from(&args[1]), &args[2..]),
+        Some("nvprofile") => xcl::gpu::nvprofile::run(&args[1..]),
         Some("rpf") if args.len() >= 2 => xcl::rpf::run(&PathBuf::from(&args[1]), &args[2..]),
         Some("--version") | Some("-V") => {
             println!("xcl {}", env!("CARGO_PKG_VERSION"));

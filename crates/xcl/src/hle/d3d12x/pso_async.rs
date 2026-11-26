@@ -737,6 +737,46 @@ mod used_tests {
         let _ = released(standin);
     }
 
+    /// A draw neither builds a cold graphics pipeline on its own thread nor waits for it; a
+    /// compute pipeline is waited for as before.
+    #[test]
+    fn a_draw_does_not_wait_for_a_cold_graphics_pipeline() {
+        let (graphics, compute) = (0x7E57_B0D1usize, 0x7E57_B0D2usize);
+        let (go, finish) = mpsc::channel::<()>();
+        let (tx, rx) = mpsc::channel();
+        submit_lazy(graphics, false, Box::new(move || {
+            let _ = tx.send((std::thread::current().name().map(str::to_owned), wanted_here()()));
+            let _ = finish.recv();
+            0x5E5E
+        }), 0);
+        // (on a thread: a draw that builds or waits would wait for `go`, below)
+        let (bound_tx, bound) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = bound_tx.send((resolve_draw_for(graphics, None), resolve_draw_for(graphics, None)));
+        });
+        let binds = bound.recv_timeout(std::time::Duration::from_secs(5));
+        if binds.is_err() {
+            let _ = go.send(());
+        }
+        assert_eq!(binds.expect("the draws built or waited for the pipeline"), (graphics, graphics));
+        let (thread, wanted) = rx.recv_timeout(std::time::Duration::from_secs(10)).expect("a worker builds it");
+        assert!(thread.as_deref().is_some_and(|n| n.starts_with("xcl-pso")), "built on {thread:?}, not on a worker");
+        assert!(wanted, "the title draws with it: its build is wanted");
+        assert!(is_pending(graphics));
+        go.send(()).unwrap();
+        let t = std::time::Instant::now();
+        while is_pending(graphics) && t.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(resolve_draw_for(graphics, None), 0x5E5E, "built: the real one");
+        submit_lazy(compute, true, Box::new(|| {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            0x5F5F
+        }), 0);
+        assert_eq!(resolve_draw_for(compute, None), 0x5F5F, "a compute pipeline is waited for");
+        let _ = (released(graphics), released(compute));
+    }
+
     /// A compile a worker's build starts is wanted once a bind waits for the build – asked from
     /// another thread, as the DXC workers do; a thread that builds nothing (no title runs here)
     /// wants nothing.
@@ -1068,6 +1108,48 @@ pub fn resolve(pso: usize) -> usize {
 /// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
 pub fn resolve_wait(pso: usize) -> usize {
     resolve_wait_for(pso, wait_budget())
+}
+
+/// `resolve_wait` for a draw (also a mesh or indirect one). With no `XCL_PSO_WAIT_MS` a graphics
+/// pipeline still being built is not waited for: its draws are left out until a worker has built
+/// it. A retail title's world start binds hundreds of cold graphics pipelines, each seconds of
+/// DXC and driver time, one after another on its render thread, and showed no frame meanwhile.
+/// A compute pipeline is still waited for: later indirect calls read what its dispatches write.
+pub fn resolve_draw(pso: usize) -> usize {
+    resolve_draw_for(pso, wait_budget())
+}
+
+fn resolve_draw_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
+    match entry(pso) {
+        Some(p) if budget.is_none() && !p.compute => {
+            p.note_use();
+            resolve_unwaited(&p, pso)
+        }
+        _ => resolve_wait_for(pso, budget),
+    }
+}
+
+/// The real pipeline once built, else the stand-in at once, with the build sent to the workers
+/// and `wanted` (the title binds it now).
+fn resolve_unwaited(p: &Arc<Pending>, pso: usize) -> usize {
+    match p.real.load(Ordering::Acquire) {
+        0 => {
+            // (before it is sent: the worker's compiles see it wanted from their start)
+            p.want();
+            if !p.sent.swap(true, Ordering::AcqRel) {
+                enqueue(p.clone());
+            }
+            if !*p.done.lock().unwrap() && !p.late.swap(true, Ordering::AcqRel) {
+                static N: AtomicUsize = AtomicUsize::new(0);
+                let n = N.fetch_add(1, Ordering::Relaxed);
+                if n < 16 || n.is_power_of_two() {
+                    crate::xlog_info!("D3D12.X: a graphics pipeline drawn with while it is still being built: its draws are left out until it is ({} so far)", n + 1);
+                }
+            }
+            p.stand(pso)
+        }
+        r => r,
+    }
 }
 
 /// `resolve_wait`, waiting at most `budget` (None: until the pipeline is built).

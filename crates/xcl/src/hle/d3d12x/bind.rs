@@ -632,7 +632,9 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
     type PcDm = unsafe extern "system" fn(*mut c_void, u32, u32, u32);
     let pc_dm: PcDm = std::mem::transmute(super::real::orig_fn(this, 79));
     let raw_pso = with(this, |s| s.pso);
-    let pso = super::pso_async::resolve_wait(raw_pso);
+    // (read first: a build that ends after the stand-in was returned must not send it to the PC)
+    let was_pending = super::pso_async::is_pending(raw_pso);
+    let pso = super::pso_async::resolve_draw(raw_pso);
     if let Some(tp) = super::real::two_pass_of(pso) {
         let groups = x.saturating_mul(y).saturating_mul(z);
         if groups == 0 {
@@ -680,7 +682,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
         }
         return;
     }
-    if super::pso_async::is_pending(raw_pso) {
+    if was_pending || super::pso_async::is_pending(raw_pso) {
         count(DRAWS_SKIPPED);
         return;
     }
@@ -716,7 +718,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     if unbuilt_compute && super::list_x::defer(this, super::list_x::Deferred::Indirect(sig, max, args, args_off, count_buf, count_off)) {
         return super::pso_async::need_by_submit(raw_pso);
     }
-    let pso = super::pso_async::resolve_wait(raw_pso);
+    // (read first: a build that ends after the stand-in was returned must not send it to the PC)
+    let was_pending = super::pso_async::is_pending(raw_pso);
+    let pso = super::pso_async::resolve_draw(raw_pso);
     let commands_at = super::real::console_buffer(args).map(|(p, n)| (p + args_off as usize, n.saturating_sub(args_off as usize)));
     let count_at = super::real::console_buffer(count_buf).filter(|&(_, n)| count_off as usize + 4 <= n).map(|(p, _)| p + count_off as usize);
     let (args_off_title, count_off_title) = (args_off, count_off);
@@ -784,7 +788,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // call with that pair is invalid (debug layer 953, "the currently set Root Signature
         // doesn't match the currently set Pipeline State Object"; a retail title's world then
         // hung the GPU, 0x887a0006). Skipped, like a draw or dispatch of such a pipeline.
-        if super::pso_async::is_pending(raw_pso) {
+        if was_pending || super::pso_async::is_pending(raw_pso) {
             count(DRAWS_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -1094,8 +1098,9 @@ pub(super) unsafe fn emit_prepared_indexed_draw(
 unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList> {
     let list = ID3D12GraphicsCommandList::from_raw_borrowed(&this)?.clone();
     let pso = with(this, |s| s.pso);
-    // a pipeline still being built in the background is waited for (its stand-in draws nothing)
-    let real = super::pso_async::resolve_wait(pso);
+    // a graphics pipeline still being built in the background: its stand-in, which draws nothing
+    // (`resolve_draw` waits for it only up to `XCL_PSO_WAIT_MS`)
+    let real = super::pso_async::resolve_draw(pso);
     if !super::real::is_translated_graphics(real) {
         // A finished two-pass MS/GS pipeline is a PC mesh shader pipeline (MS+PS) registered in
         // TWO_PASS rather than TRANSLATED_GRAPHICS. Binding the title's graphics RS and issuing

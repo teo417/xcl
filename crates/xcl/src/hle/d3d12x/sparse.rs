@@ -2252,6 +2252,7 @@ mod tests {
             windows: vec![(base, reserved.clone())],
             pools: Vec::new(),
             free: Vec::new(),
+            kept: FxHashMap::default(),
             retired: Vec::new(),
             mapped: FxHashMap::default(),
             pinned: FxHashMap::default(),

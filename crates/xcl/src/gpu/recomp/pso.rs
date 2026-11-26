@@ -1498,8 +1498,13 @@ fn slicer(dev: &ID3D12Device) -> Result<(ID3D12RootSignature, ID3D12PipelineStat
 /// A chain's command buffer (`chain_commands_bytes`) in the UNORDERED_ACCESS state: the slicer
 /// writes it, ExecuteIndirect reads it, and the CPU reads the slabs back.
 pub(crate) unsafe fn chain_commands_buffer(dev: &ID3D12Device, rounds: u32, pieces: u32, commands: u32) -> Option<ID3D12Resource> {
+    chain_commands_buffer_of(dev, chain_commands_bytes(rounds, pieces, commands))
+}
+
+/// `chain_commands_buffer` of `bytes` (at least what the chain's commands take).
+pub(crate) unsafe fn chain_commands_buffer_of(dev: &ID3D12Device, bytes: u64) -> Option<ID3D12Resource> {
     let desc = D3D12_RESOURCE_DESC {
-        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: chain_commands_bytes(rounds, pieces, commands), Height: 1, DepthOrArraySize: 1, MipLevels: 1,
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: bytes, Height: 1, DepthOrArraySize: 1, MipLevels: 1,
         SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
         Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, ..Default::default()
     };

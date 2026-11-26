@@ -440,6 +440,23 @@ pub fn video_memory() -> Option<(u64, u64)> {
     }
 }
 
+static VRAM_TITLE_HEAPS: AtomicU64 = AtomicU64::new(0);
+static VRAM_PLACED_OWN: AtomicU64 = AtomicU64::new(0);
+
+/// `[title_heaps_bytes, placed_own_bytes, chain_scratch_live, chain_cmd_pool_bytes, chain_cmd_allocs, chain_cmd_reuses, chain_cmd_alloc_micros]`
+pub fn vram_alloc_bytes() -> [u64; 7] {
+    let (scratch, cmd_pool, allocs, reuses, micros) = dispatch_chain::cmd_buffer_stats();
+    [
+        VRAM_TITLE_HEAPS.load(Ordering::Relaxed),
+        VRAM_PLACED_OWN.load(Ordering::Relaxed),
+        scratch,
+        cmd_pool,
+        allocs,
+        reuses,
+        micros,
+    ]
+}
+
 /// The device runs only 32-lane waves: wave64 compute, mesh and geometry programs need the
 /// split form (`Options::split_wave64`). Unknown device: assume so.
 fn wave32_only(device: *mut c_void) -> bool {
@@ -3260,6 +3277,9 @@ pub(super) unsafe extern "system" fn dev_create_placed_resource_x(this: *mut c_v
         Some(h) if hr2 < 0 && is_texture => Some(dev_create_committed_resource(this, &h.Properties as *const _ as usize, 0, d.as_ptr() as usize, st as usize, clear_d, riid, ppv)),
         _ => None,
     };
+    if hr3.is_some_and(|h| h >= 0) && pc_size != u64::MAX {
+        VRAM_PLACED_OWN.fetch_add(pc_size, Ordering::Relaxed);
+    }
     static N: AtomicU64 = AtomicU64::new(0);
     if N.fetch_add(1, Ordering::Relaxed) < 8 {
         let u = |o: usize| u32::from_le_bytes(x[o..o + 4].try_into().unwrap());
@@ -3317,6 +3337,9 @@ unsafe fn own_memory_if_larger_on_the_pc(this: *mut c_void, heap: usize, offset:
             "D3D12.X: CreatePlacedResource({}x{}, format {}, flags {:#x}) at {offset:#x}: {pc:#x} bytes on the PC, {console:#x} on the console – memory of its own ({hr:#x})",
             u64::from_le_bytes(x[0x10..0x18].try_into().unwrap()), u(0x18), u(0x20), u(0x30)
         );
+    }
+    if hr >= 0 {
+        VRAM_PLACED_OWN.fetch_add(pc, Ordering::Relaxed);
     }
     (hr >= 0).then_some(hr)
 }
@@ -3467,6 +3490,9 @@ unsafe fn note_heap_uma(desc: usize, ppv: *mut *mut c_void) {
         return;
     }
     let d: D3D12_HEAP_DESC = std::ptr::read_unaligned(desc as *const D3D12_HEAP_DESC);
+    if d.SizeInBytes != 0 {
+        VRAM_TITLE_HEAPS.fetch_add(d.SizeInBytes, Ordering::Relaxed);
+    }
     if d.Flags.0 & DENY_BUFFERS != 0 || d.SizeInBytes == 0 || UMA_BUFFER.lock().unwrap().is_empty() {
         return;
     }

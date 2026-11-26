@@ -85,6 +85,17 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     mb(pools as u64),
                     mb(pools_mapped as u64)
                 );
+                let va = crate::hle::d3d12x::real::vram_alloc_bytes();
+                crate::xlog_info!(
+                    "vram-allocs (cumulative): title heaps {} MB, placed-own {} MB; chain scratch {} MB, cmd_pool {} MB (allocs {} in {} ms, reuses {})",
+                    mb(va[0]),
+                    mb(va[1]),
+                    mb(va[2]),
+                    mb(va[3]),
+                    va[4],
+                    va[6] / 1000,
+                    va[5]
+                );
                 let pso = crate::hle::d3d12x::pso_async::activity();
                 let pso_active = pso[1].saturating_sub(pso[2] + pso[3]);
                 crate::xlog_info!(

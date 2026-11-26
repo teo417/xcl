@@ -2,6 +2,7 @@
 //! to the caller. Other pieces and the lazily built whole form belong to it.
 use super::*;
 use crate::gpu::{dxil::kernel::DispatchChain, recomp::pso};
+use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock, OnceLock};
 
 static PROGRAMS: AtomicU64 = AtomicU64::new(0);
@@ -197,6 +198,7 @@ struct Recording {
 /// the program records more, and the whole form is built for it
 struct Indirect {
     commands: ID3D12Resource,
+    bytes: u64,
     at: u64,
     rounds: u32,
     /// the whole form ran instead (the slicer gave it the arguments); `checked`: the chain was
@@ -298,9 +300,85 @@ unsafe fn scratch_for(dev: &ID3D12Device, list: usize, allocator: usize, needed:
     Some((s, false))
 }
 
+/// Command buffers of chains whose allocator was reset, by size, for the next chains: a retail
+/// title's world records hundreds a second, and creating them took its recording threads 0.7 ms
+/// each (48 s for 65,000 in a 240 s run). One pool for all allocators: the GPU is done with a
+/// buffer once its allocator is reset, and the next to record is mostly another one (a pool per
+/// allocator reused 15%, this one 90%).
+static CMD_POOL: LazyLock<Mutex<BTreeMap<u64, Vec<ID3D12Resource>>>> = LazyLock::new(Default::default);
+/// bytes the pool keeps at most (system memory)
+const CMD_POOL_MAX_BYTES: u64 = 512 << 20;
+static CMD_POOL_BYTES: AtomicU64 = AtomicU64::new(0);
+static CMD_ALLOCS: AtomicU64 = AtomicU64::new(0);
+static CMD_REUSES: AtomicU64 = AtomicU64::new(0);
+/// time the recording threads spent creating new command buffers
+static CMD_ALLOC_MICROS: AtomicU64 = AtomicU64::new(0);
+
+/// `XCL_CHAIN_CMD_POOL=0`: every chained ExecuteIndirect gets a new buffer, as before the pool
+fn cmd_pool_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_CHAIN_CMD_POOL").map_or(true, |v| v.trim() != "0"))
+}
+
+/// A committed buffer takes whole 64 KiB pages, so it is made that big and fits more chains.
+fn pooled_size(needed: u64) -> u64 {
+    needed.max(1).next_multiple_of(64 << 10)
+}
+
+/// The smallest pooled buffer of at least `needed` bytes, and its size.
+fn take_cmd_buffer(needed: u64) -> Option<(u64, ID3D12Resource)> {
+    let mut pool = CMD_POOL.lock().unwrap();
+    let (&bytes, buffers) = pool.range_mut(needed..).next()?;
+    let buffer = buffers.pop()?;
+    if buffers.is_empty() {
+        pool.remove(&bytes);
+    }
+    CMD_POOL_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+    Some((bytes, buffer))
+}
+
+fn return_cmd_buffer(bytes: u64, buffer: ID3D12Resource) {
+    let mut pool = CMD_POOL.lock().unwrap();
+    if !cmd_pool_enabled() || CMD_POOL_BYTES.load(Ordering::Relaxed) + bytes > CMD_POOL_MAX_BYTES {
+        return;
+    }
+    CMD_POOL_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    pool.entry(bytes).or_default().push(buffer);
+}
+
+/// Zero the words `read_back` takes: a pooled buffer holds an earlier chain's, and a list that is
+/// recorded but never run would have them read as its own.
+unsafe fn clear_read_back(buffer: &ID3D12Resource, at: u64) -> Result<(), String> {
+    let mut p = std::ptr::null_mut();
+    buffer.Map(0, Some(&D3D12_RANGE::default()), Some(&mut p)).map_err(|e| format!("mapping a chain's command buffer: {e}"))?;
+    std::ptr::write_bytes((p as *mut u8).add(at as usize), 0, 16);
+    buffer.Unmap(0, Some(&D3D12_RANGE { Begin: at as usize, End: at as usize + 16 }));
+    Ok(())
+}
+
+pub(in crate::hle::d3d12x) fn cmd_buffer_stats() -> (u64, u64, u64, u64, u64) {
+    (
+        LIVE.load(Ordering::Relaxed),
+        CMD_POOL_BYTES.load(Ordering::Relaxed),
+        CMD_ALLOCS.load(Ordering::Relaxed),
+        CMD_REUSES.load(Ordering::Relaxed),
+        CMD_ALLOC_MICROS.load(Ordering::Relaxed),
+    )
+}
+
 pub(in crate::hle::d3d12x) fn allocator_reset(allocator: usize) {
-    let recordings = RECORDINGS.lock().unwrap().remove(&allocator);
-    drop(recordings);
+    let Some(recordings) = RECORDINGS.lock().unwrap().remove(&allocator) else { return };
+    for r in recordings {
+        match Arc::try_unwrap(r) {
+            Ok(mut rec) => {
+                rec.read_back();
+                if let Some(ind) = rec.indirect.take() {
+                    return_cmd_buffer(ind.bytes, ind.commands);
+                }
+            }
+            Err(r) => drop(r),
+        }
+    }
 }
 
 unsafe fn scratch_buffer(dev: &ID3D12Device, bytes: u64) -> Option<ID3D12Resource> {
@@ -411,7 +489,24 @@ pub(in crate::hle::d3d12x) unsafe fn execute_indirect(list: &ID3D12GraphicsComma
     let before = slabs_before(chain.measured.load(Ordering::Relaxed), full.is_some(), chain.slabs.load(Ordering::Relaxed), chain.last.load(Ordering::Relaxed));
     let rounds = indirect_rounds(seen, most, before, most_rounds());
     let pieces = chain.tail.len() as u32 + 1;
-    let buffer = pso::chain_commands_buffer(dev, rounds, pieces, commands).ok_or("no buffer for the commands of a chained ExecuteIndirect")?;
+    let at = pso::chain_tail_offset(rounds, pieces);
+    let cmd_bytes = pooled_size(pso::chain_commands_bytes(rounds, pieces, commands));
+    // a pooled buffer is in COMMON again (buffers decay when their command lists have run), so
+    // the slicer's first write promotes it as it does a new one
+    let (cmd_bytes, buffer) = match take_cmd_buffer(cmd_bytes) {
+        Some((bytes, b)) => {
+            clear_read_back(&b, at)?;
+            CMD_REUSES.fetch_add(1, Ordering::Relaxed);
+            (bytes, b)
+        }
+        None => {
+            CMD_ALLOCS.fetch_add(1, Ordering::Relaxed);
+            let start = std::time::Instant::now();
+            let b = pso::chain_commands_buffer_of(dev, cmd_bytes);
+            CMD_ALLOC_MICROS.fetch_add(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+            (cmd_bytes, b.ok_or("no buffer for the commands of a chained ExecuteIndirect")?)
+        }
+    };
     // not built: asked for now, so that it is there before an ExecuteIndirect of the program
     // needs more slabs than its rounds (until then those are lost)
     if full.is_none() {
@@ -422,7 +517,6 @@ pub(in crate::hle::d3d12x) unsafe fn execute_indirect(list: &ID3D12GraphicsComma
     // the list uses `buffer` from here: the recording keeps it until the allocator is reset, also
     // when binding fails and nothing more is recorded
     let bound = bind();
-    let at = pso::chain_tail_offset(rounds, pieces);
     if bound.is_ok() {
         // the slicer left either these arguments or the rounds empty. The whole form goes first
         // (each round's pieces start after a UAV barrier), with nothing of the chain before it:
@@ -433,7 +527,7 @@ pub(in crate::hle::d3d12x) unsafe fn execute_indirect(list: &ID3D12GraphicsComma
         }
         pso::record_dispatch_chain_indirect(list, &sig, &buffer, rounds, &scratch.buffer, std::iter::once(&first).chain(&chain.tail));
     }
-    let indirect = Indirect { commands: buffer, at, rounds, whole: full.is_some(), checked: bound.is_ok() && !predicated };
+    let indirect = Indirect { commands: buffer, bytes: cmd_bytes, at, rounds, whole: full.is_some(), checked: bound.is_ok() && !predicated };
     RECORDINGS.lock().unwrap().entry(allocator).or_default().push(Arc::new(Recording { scratch, first, chain, indirect: Some(indirect) }));
     bound?;
     INDIRECT.fetch_add(1, Ordering::Relaxed);
@@ -665,10 +759,30 @@ mod tests {
             let kept = RECORDINGS.lock().unwrap().get(&allocator).map(|v| v.iter().filter_map(|r| r.indirect.as_ref().map(|i| i.checked)).collect::<Vec<_>>());
             assert_eq!(kept, Some(vec![false, false, true]));
             list.Close().unwrap();
+            let commands_of = || RECORDINGS.lock().unwrap().get(&allocator).map(|v| v.iter().filter_map(|r| r.indirect.as_ref().map(|i| i.commands.as_raw() as usize)).collect::<Vec<_>>()).unwrap_or_default();
+            let first_buffers = commands_of();
+            assert_eq!(first_buffers.len(), 3);
+            allocator_reset(allocator);
+            alloc.Reset().unwrap();
+            list.Reset(&alloc, None).unwrap();
+            let bind = || {
+                list.SetComputeRootSignature(&rs);
+                Ok(())
+            };
+            assert_eq!(execute_indirect(&list, pso, allocator, args.GetGPUVirtualAddress(), 12, 1, None, &[[1, 1, 1]], false, bind), Ok(true));
+            assert!(first_buffers.contains(&commands_of()[0]), "the reset allocator's buffer is used again");
+            list.Close().unwrap();
             allocator_reset(allocator);
             list_reset(raw_list);
             forget(pso);
             super::super::super::alloc_pool::forget_list(raw_list);
         }
+    }
+
+    #[test]
+    fn command_buffers_are_pooled_by_whole_pages() {
+        assert_eq!(super::pooled_size(1), 64 << 10);
+        assert_eq!(super::pooled_size(64 << 10), 64 << 10);
+        assert_eq!(super::pooled_size((64 << 10) + 1), 128 << 10);
     }
 }

@@ -2058,6 +2058,10 @@ pub fn note_watch(t: std::time::Duration, pages: usize, ranges_t: std::time::Dur
 /// memory, and `queue` GPU-waits for that and for new tile mappings.
 pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize) {
     let t0 = std::time::Instant::now();
+    if gpu_view::on() {
+        // before STATE: it asks kernelx
+        gpu_view::refresh_reads();
+    }
     let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
     s.note_queue(queue);

@@ -955,6 +955,13 @@ pub fn physical_page_at(va: usize) -> bool {
     AWAY.lock().unwrap().as_ref().is_some_and(|a| a.at.contains_key(&(va & !(PHYS_PAGE - 1))))
 }
 
+/// Runs `f` while this thread holds the physical-page lock `physical_page_at` takes.
+#[cfg(test)]
+pub(crate) fn with_physical_pages_locked<R>(f: impl FnOnce() -> R) -> R {
+    let _g = AWAY.lock().unwrap();
+    f()
+}
+
 /// Counts the calls that map or unmap physical pages in a GPU view (`mirrors`): what
 /// `physical_page_at` says there may have changed.
 static GPU_VIEW_MAP_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

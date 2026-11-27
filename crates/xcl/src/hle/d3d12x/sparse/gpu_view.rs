@@ -170,11 +170,23 @@ pub fn base_for(va: usize, len: usize) -> Option<usize> {
             *MIRRORS.lock().unwrap().get_or_insert_with(Mirrors::default).extents.entry((first, n)).or_insert(w)
         }
     };
+    let missing: Vec<usize> = {
+        let mut mg = MIRRORS.lock().unwrap();
+        let m = mg.get_or_insert_with(Mirrors::default);
+        (t0..t1).step_by(TILE).filter(|t| !m.title_of.contains_key(&(win + (t - first)))).collect()
+    };
+    if missing.is_empty() {
+        return Some(win + (va - first));
+    }
+    // asked with no lock held: `mirror_source` takes kernelx's locks, and kernelx calls
+    // `committed` / `decommitted` (STATE) while it holds them
+    let sources = sources_of(missing);
     // (held: STATE, then MIRRORS, as in `sync`)
     let mut g = lock_state();
     let s = g.as_mut()?;
     let mut mg = MIRRORS.lock().unwrap();
     let m = mg.get_or_insert_with(Mirrors::default);
+    // (a subset of `missing`: window tiles are never taken away again)
     let new: Vec<usize> = (t0..t1).step_by(TILE).filter(|t| !m.title_of.contains_key(&(win + (t - first)))).collect();
     if !new.is_empty() {
         if m.tiles() + new.len() > budget() / TILE {
@@ -191,11 +203,11 @@ pub fn base_for(va: usize, len: usize) -> Option<usize> {
             }
             let (a, b) = (new[i], win + (new[i] - first));
             // SAFETY: the tiles are address space of a window, with no CPU memory behind them
-            unsafe { s.ensure_mapped(b, (j - i) * TILE, |w| query_tile_holes(super::super::title_textures::mirror_source(a + (w - b)))) };
+            unsafe { s.ensure_mapped(b, (j - i) * TILE, |w| query_tile_holes(sources[&(a + (w - b))])) };
             for &t in &new[i..j] {
                 let w = win + (t - first);
                 if s.mapped.contains_key(&w) {
-                    m.show(w, t, super::super::title_textures::mirror_source(t) & !(TILE - 1));
+                    m.show(w, t, sources[&t]);
                 }
             }
             i = j;
@@ -217,25 +229,43 @@ pub fn sources() -> Vec<(usize, usize)> {
     MIRRORS.lock().unwrap().as_ref().map_or(Vec::new(), |m| m.by_read.keys().map(|&r| (r, r + TILE)).collect())
 }
 
-/// `State::mirror_up` for a submit (`before_execute`; `s` is the locked state). A page the title
-/// mapped elsewhere or now has no mapping at all is looked at again when the mappings of a GPU
-/// view change, and a few tiles in turn otherwise.
+/// Where the bytes of each of these title tiles are read from. Takes kernelx's locks: never
+/// call it with `STATE` or `MIRRORS` held.
+fn sources_of(titles: Vec<usize>) -> FxHashMap<usize, usize> {
+    titles.into_iter().map(|t| (t, super::super::title_textures::mirror_source(t) & !(TILE - 1))).collect()
+}
+
+/// Looks again at where mirrored tiles are read from: all of them when the mappings of a GPU
+/// view changed (a page the title mapped elsewhere, or that has no mapping at all now), a few in
+/// turn otherwise. For a submit, before `STATE` is taken.
+pub(super) fn refresh_reads() {
+    let look: Vec<usize> = {
+        let mut g = MIRRORS.lock().unwrap();
+        let Some(m) = g.as_mut().filter(|m| m.tiles() != 0) else { return };
+        let gen = crate::hle::kernelx::gpu_view_map_gen();
+        let titles: Vec<usize> = m.read.keys().copied().collect();
+        let look = if std::mem::replace(&mut m.gen, gen) != gen {
+            titles
+        } else {
+            let n = titles.len().max(1);
+            (0..8.min(titles.len())).map(|i| titles[(m.turn + i) % n]).collect()
+        };
+        m.turn = m.turn.wrapping_add(8);
+        look
+    };
+    let reads = sources_of(look);
+    if let Some(m) = MIRRORS.lock().unwrap().as_mut() {
+        for (t, r) in reads {
+            m.set_read(t, r);
+        }
+    }
+}
+
+/// `State::mirror_up` for a submit (`before_execute`, after `refresh_reads`; `s` is the locked
+/// state).
 pub(super) unsafe fn sync(s: &mut State, dirty: &[usize]) {
     let mut g = MIRRORS.lock().unwrap();
     let Some(m) = g.as_mut().filter(|m| m.tiles() != 0) else { return };
-    let gen = crate::hle::kernelx::gpu_view_map_gen();
-    let titles: Vec<usize> = m.read.keys().copied().collect();
-    let look: Vec<usize> = if std::mem::replace(&mut m.gen, gen) != gen {
-        titles
-    } else {
-        let n = titles.len().max(1);
-        (0..8.min(titles.len())).map(|i| titles[(m.turn + i) % n]).collect()
-    };
-    m.turn = m.turn.wrapping_add(8);
-    for t in look {
-        let r = super::super::title_textures::mirror_source(t) & !(TILE - 1);
-        m.set_read(t, r);
-    }
     let n = s.mirror_up(m, dirty);
     static SENT: AtomicU64 = AtomicU64::new(0);
     static CALLS: AtomicU64 = AtomicU64::new(0);
@@ -272,14 +302,10 @@ mod tests {
         assert_eq!(m.fresh, vec![0x30_0000], "the same place again is nothing new");
     }
 
-    /// The bytes of the title's pages reach the window tiles mapped for them, and again when the
-    /// title writes a page; a page that went away is left as it is.
-    #[test]
-    fn gpu_the_titles_bytes_reach_the_window_tiles_shown_for_them() {
+    /// A state with one window of one tile, at `window`.
+    unsafe fn state_with_window(window: usize) -> State {
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
         use windows::Win32::Graphics::Dxgi::*;
-        use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE};
-        unsafe {
             let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
             let mut dev: Option<ID3D12Device> = None;
             if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
@@ -287,12 +313,6 @@ mod tests {
                 D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
             }
             let dev = dev.expect("D3D12 device");
-            let window = VirtualAlloc(std::ptr::null(), TILE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
-            let source = VirtualAlloc(std::ptr::null(), TILE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
-            assert!(window % TILE == 0 && source % TILE == 0);
-            for i in 0..TILE / 4 {
-                *((source + 4 * i) as *mut u32) = i as u32 * 7 + 1;
-            }
             let mut reserved: Option<ID3D12Resource> = None;
             dev.CreateReservedResource(&buffer_desc(TILE as u64), D3D12_RESOURCE_STATE_COMMON, None, &mut reserved).expect("reserved buffer");
             let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("queue");
@@ -309,7 +329,14 @@ mod tests {
                 list.Close().expect("close");
                 slots.push(UploadSlot { alloc, list, fence_val: 0 });
             }
-            let mut s = State {
+            State {
+                rb_lanes: (0..2).map(|_| rb_lane_new(&dev).expect("lane")).collect(),
+                rb_seq: 0,
+                rb_landed: Vec::new(),
+                rb_pool: Vec::new(),
+                kept: FxHashMap::default(),
+                quarantined: VecDeque::new(),
+                queue_fences: FxHashMap::default(),
                 dev,
                 queue,
                 fence,
@@ -341,7 +368,57 @@ mod tests {
                 waited: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),
-            };
+            }
+    }
+
+    /// A submit's `sync` runs under STATE, and kernelx takes STATE while it holds its own locks:
+    /// where a tile is read from has to be asked outside it (`refresh_reads`).
+    #[test]
+    fn a_submit_under_the_state_does_not_ask_kernelx() {
+        use crate::hle::kernelx::{mirrors, with_physical_pages_locked};
+        use windows_sys::Win32::System::Memory::MEM_RELEASE;
+        // two reservations of 64 KiB pages, the second the GPU view of the first
+        const TYPE: u32 = 0x2040_0000;
+        const SIZE: usize = 0x1235_0000;
+        let (cpu, view) = (0x5100_0000_0000usize, 0x5200_0000_0000usize);
+        mirrors::reserved(cpu, SIZE, TYPE, PAGE_READWRITE);
+        mirrors::reserved(view, SIZE, TYPE, 0x800 | 0x01);
+        MIRRORS.lock().unwrap().get_or_insert_with(Mirrors::default).show(0x30_0000, view, view);
+        let (done, finished) = std::sync::mpsc::channel();
+        let (worker, waited) = with_physical_pages_locked(|| {
+            let worker = std::thread::spawn(move || unsafe {
+                let window = VirtualAlloc(std::ptr::null(), TILE, windows_sys::Win32::System::Memory::MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+                let mut s = state_with_window(window);
+                sync(&mut s, &[]);
+                drop(s);
+                VirtualFree(window as *mut c_void, 0, MEM_RELEASE);
+                done.send(()).unwrap();
+            });
+            let waited = finished.recv_timeout(std::time::Duration::from_secs(60));
+            (worker, waited)
+        });
+        worker.join().unwrap();
+        assert!(waited.is_ok(), "sync waited for kernelx");
+        refresh_reads();
+        assert_eq!(MIRRORS.lock().unwrap().as_ref().unwrap().read[&view], cpu, "nothing mapped in the view: the CPU view");
+        *MIRRORS.lock().unwrap() = None;
+        mirrors::released(view);
+        mirrors::released(cpu);
+    }
+
+    /// The bytes of the title's pages reach the window tiles mapped for them, and again when the
+    /// title writes a page; a page that went away is left as it is.
+    #[test]
+    fn gpu_the_titles_bytes_reach_the_window_tiles_shown_for_them() {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE};
+        unsafe {
+            let window = VirtualAlloc(std::ptr::null(), TILE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            let source = VirtualAlloc(std::ptr::null(), TILE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert!(window % TILE == 0 && source % TILE == 0);
+            for i in 0..TILE / 4 {
+                *((source + 4 * i) as *mut u32) = i as u32 * 7 + 1;
+            }
+            let mut s = state_with_window(window);
             let mut m = Mirrors::default();
             s.ensure_mapped(window, TILE, |_| query_tile_holes(source));
             m.show(window, 0x7FFF_0000, source);

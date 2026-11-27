@@ -11,13 +11,13 @@
 //! replaced by the window's. Only what is read is mirrored: a write through it is lost, so UAVs
 //! keep their address.
 
-use std::collections::HashMap;
-
 use super::*;
 
-/// The window space a chunk of the title's view takes. Views inside one chunk share it; a view
-/// across chunks gets a space of its own (its bytes have to be contiguous).
-const EXTENT: usize = 1 << 20;
+/// The unit window space is given in: a chunk of the title's view. A view takes the space its
+/// chunks have when that is contiguous (its bytes have to be), else a new block for all of them.
+/// (A retail title's world had about 2 GB of window space left for these: 1 MiB units, and a
+/// block of its own for every span of them, used it up with a third of it holding tiles.)
+const EXTENT: usize = 1 << 18;
 /// Views longer than this keep their address.
 const MOST: usize = 64 << 20;
 
@@ -34,8 +34,8 @@ fn budget() -> usize {
 
 #[derive(Default)]
 pub(super) struct Mirrors {
-    /// (first byte of the title's chunks, chunks) → the window space of them
-    extents: HashMap<(usize, usize), usize>,
+    /// chunk of the title's view → its window space in the newest block holding it
+    chunks: FxHashMap<usize, usize>,
     /// window tile → title tile (an address in the GPU view)
     title_of: FxHashMap<usize, usize>,
     /// where the bytes of a title tile are read from (its own address, or the CPU view's)
@@ -89,6 +89,18 @@ impl Mirrors {
 
     pub(super) fn tiles(&self) -> usize {
         self.title_of.len()
+    }
+
+    /// Where the `n` chunks from `first` lie in a row of window space, if they do.
+    fn window_of(&self, first: usize, n: usize) -> Option<usize> {
+        let win = *self.chunks.get(&first)?;
+        (1..n).all(|i| self.chunks.get(&(first + i * EXTENT)) == Some(&(win + i * EXTENT))).then_some(win)
+    }
+
+    /// The `n` chunks from `first` have window space at `win` from now on (views made before
+    /// keep theirs: its tiles stay mirrored).
+    fn set_window(&mut self, first: usize, n: usize, win: usize) {
+        self.chunks.extend((0..n).map(|i| (first + i * EXTENT, win + i * EXTENT)));
     }
 }
 
@@ -162,12 +174,24 @@ pub fn base_for(va: usize, len: usize) -> Option<usize> {
     let (t0, t1) = (va & !(TILE - 1), (last & !(TILE - 1)) + TILE);
     let first = t0 & !(EXTENT - 1);
     let n = (t1 - first).div_ceil(EXTENT);
-    let known = MIRRORS.lock().unwrap().get_or_insert_with(Mirrors::default).extents.get(&(first, n)).copied();
+    let known = MIRRORS.lock().unwrap().get_or_insert_with(Mirrors::default).window_of(first, n);
     let win = match known {
         Some(w) => w,
         None => {
             let (w, _) = u.sparse_alloc(n * EXTENT, EXTENT)?;
-            *MIRRORS.lock().unwrap().get_or_insert_with(Mirrors::default).extents.entry((first, n)).or_insert(w)
+            let mut g = MIRRORS.lock().unwrap();
+            let m = g.get_or_insert_with(Mirrors::default);
+            match m.window_of(first, n) {
+                // another thread was first
+                Some(other) => {
+                    u.sparse_release(w);
+                    other
+                }
+                None => {
+                    m.set_window(first, n, w);
+                    w
+                }
+            }
         }
     };
     let missing: Vec<usize> = {
@@ -300,6 +324,24 @@ mod tests {
         assert_eq!(m.shown_at(&[0xDD_2000]), vec![(0x30_2000, 0xDD_2000)]);
         m.set_read(0xBB_0000, 0xDD_0000);
         assert_eq!(m.fresh, vec![0x30_0000], "the same place again is nothing new");
+    }
+
+    #[test]
+    fn a_view_inside_a_block_of_chunks_takes_its_space() {
+        let mut m = Mirrors::default();
+        let (title, win) = (0x40_0000, 0x1000_0000);
+        assert_eq!(m.window_of(title, 1), None);
+        m.set_window(title, 4, win);
+        assert_eq!(m.window_of(title, 4), Some(win));
+        assert_eq!(m.window_of(title + EXTENT, 2), Some(win + EXTENT), "inside the block");
+        assert_eq!(m.window_of(title + 2 * EXTENT, 3), None, "past its end");
+        // two blocks side by side in the title's view, apart in the window
+        m.set_window(title + 4 * EXTENT, 1, 0x2000_0000);
+        assert_eq!(m.window_of(title + 3 * EXTENT, 2), None);
+        m.set_window(title + 3 * EXTENT, 2, 0x3000_0000);
+        assert_eq!(m.window_of(title + 3 * EXTENT, 2), Some(0x3000_0000));
+        assert_eq!(m.window_of(title, 3), Some(win), "the chunks not taken over stay");
+        assert_eq!(m.window_of(title, 4), None);
     }
 
     /// A state with one window of one tile, at `window`.

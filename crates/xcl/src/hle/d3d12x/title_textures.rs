@@ -524,6 +524,9 @@ fn source_of(va: usize, len: usize) -> Source {
 fn recheck_gpu_view_sources() {
     static SEEN: AtomicU64 = AtomicU64::new(0);
     let pages = crate::hle::kernelx::mirrors::take_changed();
+    if super::sparse::gpu_view::on() && !pages.is_empty() {
+        super::sparse::gpu_view::reads_changed(&pages);
+    }
     let gen = crate::hle::kernelx::gpu_view_map_gen();
     let all = SEEN.swap(gen, Ordering::AcqRel) != gen;
     if !all && pages.is_empty() {

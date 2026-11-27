@@ -42,6 +42,8 @@ pub(super) struct Mirrors {
     read: FxHashMap<usize, usize>,
     /// read tile → window tiles whose bytes are there
     by_read: FxHashMap<usize, Vec<usize>>,
+    /// title tile → window tiles that show it
+    by_title: FxHashMap<usize, Vec<usize>>,
     /// window tiles none of whose bytes have gone up yet (or whose pages changed place)
     fresh: Vec<usize>,
     /// the next title tile the slow check looks at
@@ -58,6 +60,7 @@ impl Mirrors {
         self.title_of.insert(win, title);
         self.read.insert(title, read);
         self.by_read.entry(read).or_default().push(win);
+        self.by_title.entry(title).or_default().push(win);
         self.fresh.push(win);
     }
 
@@ -66,7 +69,7 @@ impl Mirrors {
         if old == Some(read) {
             return;
         }
-        let wins: Vec<usize> = self.title_of.iter().filter(|&(_, &t)| t == title).map(|(&w, _)| w).collect();
+        let wins: Vec<usize> = self.by_title.get(&title).cloned().unwrap_or_default();
         if let Some(o) = old.and_then(|o| self.by_read.get_mut(&o)) {
             o.retain(|w| !wins.contains(w));
         }
@@ -256,7 +259,36 @@ pub fn sources() -> Vec<(usize, usize)> {
 /// Where the bytes of each of these title tiles are read from. Takes kernelx's locks: never
 /// call it with `STATE` or `MIRRORS` held.
 fn sources_of(titles: Vec<usize>) -> FxHashMap<usize, usize> {
-    titles.into_iter().map(|t| (t, super::super::title_textures::mirror_source(t) & !(TILE - 1))).collect()
+    titles.into_iter().map(|t| (t, source_of(t) & !(TILE - 1))).collect()
+}
+
+/// Where the title tile at `t` is read from: what the queue's page-mapping method put there (a
+/// page it unmapped has nothing to read), else as a texture at it would be.
+fn source_of(t: usize) -> usize {
+    match crate::hle::kernelx::mirrors::mapped_source(t) {
+        Some(Some(a)) => a,
+        Some(None) => t,
+        None => super::super::title_textures::mirror_source(t),
+    }
+}
+
+/// The page-mapping method changed what these ranges of GPU views show: the mirrored tiles in
+/// them are looked at again. Not under `STATE` (as `sources_of`).
+pub fn reads_changed(ranges: &[(usize, usize)]) {
+    let titles: Vec<usize> = {
+        let g = MIRRORS.lock().unwrap();
+        let Some(m) = g.as_ref() else { return };
+        ranges.iter().flat_map(|&(a, b)| (a & !(TILE - 1)..b).step_by(TILE)).filter(|t| m.read.contains_key(t)).collect()
+    };
+    if titles.is_empty() {
+        return;
+    }
+    let reads = sources_of(titles);
+    if let Some(m) = MIRRORS.lock().unwrap().as_mut() {
+        for (t, r) in reads {
+            m.set_read(t, r);
+        }
+    }
 }
 
 /// Looks again at where mirrored tiles are read from: all of them when the mappings of a GPU
@@ -443,6 +475,21 @@ mod tests {
         assert!(waited.is_ok(), "sync waited for kernelx");
         refresh_reads();
         assert_eq!(MIRRORS.lock().unwrap().as_ref().unwrap().read[&view], cpu, "nothing mapped in the view: the CPU view");
+        // the queue's page-mapping method puts pool page 1 there
+        #[repr(C)]
+        struct Batch {
+            dest: u64,
+            ranges_n: u32,
+            _pad: u32,
+            ranges: usize,
+        }
+        let pool = unsafe { VirtualAlloc(std::ptr::null(), 4 * TILE, windows_sys::Win32::System::Memory::MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        let ranges = [[0u32, 1, 1]];
+        let batch = [Batch { dest: view as u64, ranges_n: 1, _pad: 0, ranges: ranges.as_ptr() as usize }];
+        assert!(unsafe { mirrors::apply_batches(1, batch.as_ptr() as usize, pool, 4) }.is_some());
+        reads_changed(&[(view, view + TILE)]);
+        assert_eq!(MIRRORS.lock().unwrap().as_ref().unwrap().read[&view], pool + TILE, "the pool page under it");
+        unsafe { VirtualFree(pool as *mut c_void, 0, MEM_RELEASE) };
         *MIRRORS.lock().unwrap() = None;
         mirrors::released(view);
         mirrors::released(cpu);

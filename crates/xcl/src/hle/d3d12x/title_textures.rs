@@ -677,9 +677,30 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     // write-watched regions) only when the set of textures, tiles, or reservations changed.
     let mut regions = u.watch_regions();
     regions.extend(crate::hle::kernelx::graphics_reservations());
-    let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().by_res.values().map(|e| (e.src & !0xFFF, (e.src + e.tex.size() as usize + 0xFFF) & !0xFFF)).collect();
+    let (mut tex_all, mut tex_gpu, mut tex_n) = (0usize, 0usize, 0usize);
+    let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().by_res.values().map(|e| {
+        tex_n += 1;
+        tex_all += e.tex.size() as usize;
+        if e.gpu_written {
+            tex_gpu += e.tex.size() as usize;
+        }
+        (e.src & !0xFFF, (e.src + e.tex.size() as usize + 0xFFF) & !0xFFF)
+    }).collect();
+    let n_tex = wanted.len();
     wanted.extend(super::sparse::mapped_ranges());
+    let tiles: usize = wanted[n_tex..].iter().map(|r| r.1 - r.0).sum();
     let computed = Arc::new(watch_ranges(&regions, wanted));
+    {
+        static RECOMPUTES: AtomicU64 = AtomicU64::new(0);
+        if RECOMPUTES.fetch_add(1, Ordering::Relaxed) % 256 == 0 {
+            let region_mb: usize = regions.iter().map(|r| r.1).sum::<usize>() >> 20;
+            let scanned: usize = computed.iter().map(|r| r.1).sum::<usize>() >> 20;
+            crate::xlog_info!(
+                "write-watch ranges: {tex_n} textures {} MB ({} MB GPU-written), sparse tiles {} MB; {} regions {region_mb} MB; scanned {scanned} MB in {} ranges",
+                tex_all >> 20, tex_gpu >> 20, tiles >> 20, regions.len(), computed.len()
+            );
+        }
+    }
     *WATCH_CACHE.lock().unwrap() = Some((key, Arc::clone(&computed)));
     computed
 }
@@ -738,6 +759,16 @@ unsafe fn refresh_once(queue: *mut c_void) {
     let watch_t0 = std::time::Instant::now();
     let mut page = 0x1000u32;
     let ranges = cached_watch_ranges(u);
+    let look = LOOK.fetch_add(1, Ordering::Relaxed);
+    let scan = if full_look(look, cold_every()) {
+        HOT.lock().unwrap().retain(|_, h| h.2 > look);
+        Arc::clone(&ranges)
+    } else {
+        let mut regions = u.watch_regions();
+        regions.extend(crate::hle::kernelx::graphics_reservations());
+        Arc::new(partial_look_ranges(&regions, super::sparse::mapped_ranges(), &HOT.lock().unwrap()))
+    };
+    let ranges_t = watch_t0.elapsed();
     let dirty_len = DIRTY_BUF.with(|dcell| {
         let mut dirty = dcell.borrow_mut();
         dirty.clear();
@@ -746,14 +777,14 @@ unsafe fn refresh_once(queue: *mut c_void) {
             if buf.len() < 16384 {
                 buf.resize(16384, std::ptr::null_mut());
             }
-            for &(base, size) in ranges.iter() {
+            for &(base, size) in scan.iter() {
                 take_written(base, size, &mut buf, &mut dirty, &mut page);
             }
         });
         dirty.sort_unstable();
         dirty.len()
     });
-    super::sparse::note_watch(watch_t0.elapsed(), dirty_len);
+    super::sparse::note_watch(watch_t0.elapsed(), dirty_len, ranges_t, scan.len(), scan.iter().map(|r| r.1).sum());
     if super::present::trace_frame() {
         // every 600th look: what the CPU's view of a few textures holds now (does the title's
         // data reach the address at all, and is the texture still kept in step?)
@@ -803,17 +834,24 @@ unsafe fn refresh_once(queue: *mut c_void) {
     let todo: Vec<(ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
         let dirty = dcell.borrow();
         let mut t = TEXTURES.lock().unwrap();
+        let mut hot = HOT.lock().unwrap();
         t.by_res
             .iter_mut()
-            .filter(|(_, e)| {
+            .filter(|(&res, e)| {
+                // a texture made or uploaded lately is hot too: a title often writes it again soon
                 if e.pending {
+                    mark_hot(&mut hot, res, e.src, e.tex.size() as usize, look);
                     return true;
                 }
                 if e.gpu_written {
                     return false;
                 }
                 let i = dirty.partition_point(|&p| p + page as usize <= e.src);
-                dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize)
+                let written = dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize);
+                if written {
+                    mark_hot(&mut hot, res, e.src, e.tex.size() as usize, look);
+                }
+                written
             })
             .filter_map(|(&res, e)| {
                 if e.pending {
@@ -1314,6 +1352,44 @@ unsafe fn upload_queue(dev: &ID3D12Device, device: usize) -> Result<ID3D12Comman
 /// reported as written too; the uploads keep to what they track.
 const WATCH_GAP: usize = 64 << 20;
 
+/// A look in this many scans every texture; the others scan the sparse tiles and the "hot"
+/// textures only. A retail game keeps ~25 000 streamed textures (6 GB) in step, written once:
+/// scanning them before each of its ~70 submits a second (18 GB of address space with the
+/// tiles, ~6.7 ms a look) took 56 % of its submitting thread. A write to a cold texture is not
+/// lost – its pages stay marked until a look covers them – only seen up to this many looks
+/// later. `XCL_TEXTURE_WATCH_EVERY=1`: every texture at every look, as before.
+const COLD_EVERY: u64 = 8;
+/// Looks a texture stays hot (scanned at every look) after a CPU write was found in it
+const HOT_LOOKS: u64 = 64;
+
+/// The looks so far (`refresh_once`)
+static LOOK: AtomicU64 = AtomicU64::new(0);
+/// Textures with a CPU write in the last `HOT_LOOKS` looks: resource → (start, end, hot until
+/// look)
+static HOT: Mutex<BTreeMap<usize, (usize, usize, u64)>> = Mutex::new(BTreeMap::new());
+
+fn cold_every() -> u64 {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| std::env::var("XCL_TEXTURE_WATCH_EVERY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(COLD_EVERY).max(1))
+}
+
+/// Whether look `look` scans every texture
+fn full_look(look: u64, every: u64) -> bool {
+    every <= 1 || look % every == 0
+}
+
+/// What a look that is not a full one scans: the sparse `tiles` (start, end) and the hot
+/// textures, inside `regions`
+fn partial_look_ranges(regions: &[(usize, usize)], mut tiles: Vec<(usize, usize)>, hot: &BTreeMap<usize, (usize, usize, u64)>) -> Vec<(usize, usize)> {
+    tiles.extend(hot.values().map(|h| (h.0, h.1)));
+    watch_ranges(regions, tiles)
+}
+
+/// Texture `res` at `[src, src + size)` had a CPU write at look `look`
+fn mark_hot(hot: &mut BTreeMap<usize, (usize, usize, u64)>, res: usize, src: usize, size: usize, look: u64) {
+    hot.insert(res, (src & !0xFFF, (src + size + 0xFFF) & !0xFFF, look + HOT_LOOKS));
+}
+
 /// The parts of `wanted` (start, end) inside `regions` (base, size), merged (gaps under
 /// `WATCH_GAP` too) and sorted, as (base, size) – each within one region (a write-watch call
 /// covers one allocation).
@@ -1780,6 +1856,58 @@ mod tests {
                 take_written(base, PAGES * PAGE, &mut buf, &mut dirty, &mut page);
                 assert!(dirty.is_empty(), "the look reset what it reported");
             }
+            VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
+    /// Between full looks only the sparse tiles and the hot textures are scanned; a write to a
+    /// cold texture is not lost on the looks that skip it: the next full look finds it, and
+    /// from then on the texture is hot (scanned at each look) until `HOT_LOOKS` looks go by.
+    #[test]
+    fn cold_textures_are_scanned_on_full_looks_and_lose_no_write() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const MB: usize = 1 << 20;
+        // a region of 512 MB: sparse tiles at its start, a cold texture past WATCH_GAP from them
+        const SIZE: usize = 512 * MB;
+        assert!(full_look(0, 8) && !full_look(1, 8) && full_look(16, 8));
+        assert!((0..5).all(|k| full_look(k, 1)), "XCL_TEXTURE_WATCH_EVERY=1: every look is full");
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) as usize;
+            assert!(base != 0);
+            let regions = [(base, SIZE)];
+            let tiles = vec![(base, base + MB)];
+            let tex = (base + 256 * MB, 4 * MB);
+            let mut hot = BTreeMap::new();
+            let partial = partial_look_ranges(&regions, tiles.clone(), &hot);
+            assert_eq!(partial, vec![(base, MB)], "a cold texture is not in a partial look");
+            let full = watch_ranges(&regions, vec![tiles[0], (tex.0, tex.0 + tex.1)]);
+            assert_eq!(full, vec![(base, MB), (tex.0, tex.1)]);
+            let mut buf = vec![std::ptr::null_mut::<c_void>(); 1024];
+            let (mut dirty, mut page) = (Vec::new(), 0u32);
+            for &(a, n) in &full {
+                take_written(a, n, &mut buf, &mut dirty, &mut page);
+            }
+            // the title writes the cold texture and a tile; the partial looks report the tile
+            ((tex.0 + 5 * 4096) as *mut u8).write_volatile(1);
+            (base as *mut u8).write_volatile(1);
+            for _ in 0..7 {
+                dirty.clear();
+                for &(a, n) in &partial {
+                    take_written(a, n, &mut buf, &mut dirty, &mut page);
+                }
+                assert!(!dirty.contains(&(tex.0 + 5 * 4096)));
+            }
+            // the full look still finds the texture's page
+            dirty.clear();
+            for &(a, n) in &full {
+                take_written(a, n, &mut buf, &mut dirty, &mut page);
+            }
+            assert!(dirty.contains(&(tex.0 + 5 * 4096)), "the write survived the partial looks: {dirty:x?}");
+            mark_hot(&mut hot, 1, tex.0, tex.1, 8);
+            assert_eq!(partial_look_ranges(&regions, tiles.clone(), &hot), vec![(base, MB), (tex.0, tex.1)], "a hot texture is in every look");
+            hot.retain(|_, h| h.2 > 8 + HOT_LOOKS);
+            assert_eq!(partial_look_ranges(&regions, tiles, &hot), vec![(base, MB)], "cold again after HOT_LOOKS looks");
             VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
         }
     }

@@ -2021,14 +2021,20 @@ pub fn mapped_ranges() -> Vec<(usize, usize)> {
     s.runs.clone().unwrap_or_default()
 }
 
-/// time spent and pages found by the write-watch scans (`refresh_once`), for the timing line
-static WATCH: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// time spent and pages found by the write-watch scans (`refresh_once`), for the timing line;
+/// then of that time the µs spent working out the ranges, the looks, and the ranges and bytes
+/// the last look walked
+static WATCH: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 /// [lock wait, chunk scan, upload] in µs, runs uploaded
 static PHASES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
-pub fn note_watch(t: std::time::Duration, pages: usize) {
+pub fn note_watch(t: std::time::Duration, pages: usize, ranges_t: std::time::Duration, ranges: usize, bytes: usize) {
     WATCH[0].fetch_add(t.as_micros() as u64, Ordering::Relaxed);
     WATCH[1].fetch_add(pages as u64, Ordering::Relaxed);
+    WATCH[2].fetch_add(ranges_t.as_micros() as u64, Ordering::Relaxed);
+    WATCH[3].fetch_add(1, Ordering::Relaxed);
+    WATCH[4].store(ranges as u64, Ordering::Relaxed);
+    WATCH[5].store(bytes as u64, Ordering::Relaxed);
 }
 
 /// Before the title's ExecuteCommandLists on `queue`: the pages the CPU wrote (`dirty`, 4 KiB
@@ -2112,6 +2118,13 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
                 ms(&PHASES[1]),
                 ms(&PHASES[2]),
                 PHASES[3].load(Ordering::Relaxed)
+            );
+            crate::xlog_info!(
+                "sparse windows write-watch: {} looks, {} ms of them working out the ranges; the last look {} ranges, {} MB",
+                WATCH[3].load(Ordering::Relaxed),
+                ms(&WATCH[2]),
+                WATCH[4].load(Ordering::Relaxed),
+                WATCH[5].load(Ordering::Relaxed) >> 20
             );
         }
     }

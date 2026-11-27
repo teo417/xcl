@@ -462,6 +462,9 @@ impl<'a> Pipeline<'a> {
             let at = task.req.destination as usize;
             // The title can unmap the destination while a decoder runs. The late
             // check resolves lazy pages, and the kernel copy handles a subsequent unmap.
+            // (The kernel copy cannot be let through a watch-trap read-only block on its
+            // fault: the destination stays writable from the check to the end of the copy.)
+            let _trap = crate::hle::d3d12x::watch_trap::guard(at, n);
             if writable(at, n) && (n == 0 || write_destination(at, &payload.bytes[..n])) {
                 Ok(())
             } else {

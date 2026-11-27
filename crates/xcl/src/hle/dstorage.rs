@@ -821,6 +821,8 @@ unsafe fn read_own(at: usize, out: *mut u8, len: usize) -> bool {
 fn writable(p: usize, n: usize) -> bool {
     let Some(end) = p.checked_add(n) else { return false };
     crate::hle::kernelx::lazy::ensure(p, n);
+    // a read-only block of the watch trap is writable here: the copy into it faults and is let through
+    let _trap = crate::hle::d3d12x::watch_trap::guard(p, n);
     if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(p, n) || u.is_sparse(p) && crate::hle::d3d12x::sparse::range_committed(p, n)) {
         return true;
     }

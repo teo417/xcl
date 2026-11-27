@@ -760,7 +760,9 @@ unsafe fn refresh_once(queue: *mut c_void) {
     let mut page = 0x1000u32;
     let ranges = cached_watch_ranges(u);
     let look = LOOK.fetch_add(1, Ordering::Relaxed);
-    let scan = if full_look(look, cold_every()) {
+    // the watch trap leaves cold memory out by itself and counts a block's clean looks: with it
+    // every look is a full one
+    let scan = if super::watch_trap::on() || full_look(look, cold_every()) {
         HOT.lock().unwrap().retain(|_, h| h.2 > look);
         Arc::clone(&ranges)
     } else {
@@ -777,11 +779,18 @@ unsafe fn refresh_once(queue: *mut c_void) {
             if buf.len() < 16384 {
                 buf.resize(16384, std::ptr::null_mut());
             }
-            for &(base, size) in scan.iter() {
-                take_written(base, size, &mut buf, &mut dirty, &mut page);
+            if super::watch_trap::on() {
+                let mut p = page;
+                super::watch_trap::look(&scan, &mut dirty, 0x1000, |a, n, d| take_written(a, n, &mut buf, d, &mut p));
+                page = p;
+            } else {
+                for &(base, size) in scan.iter() {
+                    take_written(base, size, &mut buf, &mut dirty, &mut page);
+                }
             }
         });
         dirty.sort_unstable();
+        dirty.dedup();
         dirty.len()
     });
     super::sparse::note_watch(watch_t0.elapsed(), dirty_len, ranges_t, scan.len(), scan.iter().map(|r| r.1).sum());

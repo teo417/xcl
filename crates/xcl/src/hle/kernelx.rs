@@ -252,6 +252,7 @@ unsafe fn commit_sparse(a: usize, n: usize, p: u32) -> *mut c_void {
 }
 
 pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: u32, p: u32) -> *mut c_void {
+    let _trap = crate::hle::d3d12x::watch_trap::guard(addr as usize, size);
     if let Some(q) = placeholders::alloc(addr, size, t, sanitize_protect(p)) {
         trace_mem("VirtualAlloc (placeholder)", addr as usize, size, t as u64, p, q as usize);
         return q;
@@ -443,6 +444,7 @@ fn keep_last_error<R>(f: impl FnOnce() -> R) -> R {
 /// Blocks of the unified memory region go back to it (MEM_RELEASE) or stay (MEM_DECOMMIT
 /// zeroes them); others to Windows.
 pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32) -> BOOL {
+    let _trap = crate::hle::d3d12x::watch_trap::guard_free(addr as usize, size);
     if let Some(ok) = placeholders::free(addr, size, t) {
         return ok;
     }
@@ -521,10 +523,12 @@ pub unsafe extern "system" fn VirtualAllocEx(proc_: HANDLE, addr: *const c_void,
 }
 
 pub unsafe extern "system" fn VirtualProtect(addr: *const c_void, size: usize, p: u32, old: *mut u32) -> BOOL {
+    let _trap = crate::hle::d3d12x::watch_trap::guard(addr as usize, size);
     mem::VirtualProtect(addr, size, sanitize_protect(p), old)
 }
 
 pub unsafe extern "system" fn VirtualProtectEx(proc_: HANDLE, addr: *const c_void, size: usize, p: u32, old: *mut u32) -> BOOL {
+    let _trap = crate::hle::d3d12x::watch_trap::guard(if proc_ == thr::GetCurrentProcess() { addr as usize } else { 0 }, size);
     mem::VirtualProtectEx(proc_, addr, size, sanitize_protect(p), old)
 }
 
@@ -1093,6 +1097,7 @@ unsafe fn give_back_homes(away: &mut Away) {
         if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(start)) {
             crate::hle::d3d12x::sparse::decommitted(start, end - start);
         }
+        let _trap = crate::hle::d3d12x::watch_trap::guard(start, end - start);
         mem::VirtualFree(start as *mut c_void, end - start, mem::MEM_DECOMMIT);
     }
 }
@@ -1100,6 +1105,7 @@ unsafe fn give_back_homes(away: &mut Away) {
 /// The page's home, committed again if `move_home_away` gave it back (None: it could not be).
 unsafe fn home_again(home: usize) -> Option<usize> {
     if lazy_home(home) && !committed_page(home) {
+        let _trap = crate::hle::d3d12x::watch_trap::guard(home, PHYS_PAGE);
         if mem::VirtualAlloc(home as *const c_void, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null() {
             crate::xlog_warn!("physical page: its home {home:#x} could not be committed again");
             return None;
@@ -1121,6 +1127,7 @@ unsafe fn commit_homes(home: usize, n: usize) -> bool {
     if committed_range(home, len) {
         return true;
     }
+    let _trap = crate::hle::d3d12x::watch_trap::guard(home, len);
     if mem::VirtualAlloc(home as *const c_void, len, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null() {
         crate::xlog_warn!("physical pages: {n} at their home {home:#x} could not be committed");
         return false;
@@ -1236,6 +1243,7 @@ unsafe fn release_at(at: usize) {
     if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(at)) {
         crate::hle::d3d12x::sparse::decommitted(at, PHYS_PAGE);
     }
+    let _trap = crate::hle::d3d12x::watch_trap::guard(at, PHYS_PAGE);
     mem::VirtualFree(at as *mut c_void, PHYS_PAGE, mem::MEM_DECOMMIT);
 }
 
@@ -1251,6 +1259,7 @@ unsafe fn move_away(away: &mut Away, old: usize, at: usize, page: usize, in_uma:
         return Ok(false);
     }
     // (a destination that cannot be committed leaves the page where it was, mapped as before)
+    let _trap = crate::hle::d3d12x::watch_trap::guard(at, PHYS_PAGE);
     if !in_uma && mem::VirtualAlloc(at as *const c_void, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null() {
         return Err(());
     }
@@ -1446,6 +1455,7 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
             away.page.insert(p, at);
             continue;
         }
+        let _trap = crate::hle::d3d12x::watch_trap::guard(at, PHYS_PAGE);
         if !in_uma(at) && mem::VirtualAlloc(at as *const c_void, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null() {
             fnd::SetLastError(fnd::ERROR_INVALID_ADDRESS);
             return std::ptr::null_mut();

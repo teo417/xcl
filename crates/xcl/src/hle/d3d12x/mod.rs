@@ -37,6 +37,7 @@ pub mod title_list;
 pub mod title_textures;
 mod uma_driver;
 pub mod vram;
+pub mod watch_trap;
 
 use std::ffi::c_void;
 use std::sync::OnceLock;

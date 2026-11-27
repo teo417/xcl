@@ -41,6 +41,7 @@ unsafe fn commit(page: usize) -> bool {
     if !g.remove(&page) {
         return false;
     }
+    let _trap = crate::hle::d3d12x::watch_trap::guard(page, PAGE);
     !VirtualAlloc(page as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null()
 }
 

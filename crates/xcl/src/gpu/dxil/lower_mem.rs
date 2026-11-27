@@ -335,7 +335,9 @@ impl Lw {
                 _ => {}
             }
         }
-        if self.heap_mem.is_some() || self.gfx.is_some() {
+        // coherent windows too: their offset-0 reads skip the L1 cache, and every thread of a
+        // dispatch would read the same few lines
+        if self.heap_mem.is_some() || self.gfx.is_some() || self.mems_coherent {
             return self.with_mem_i32s(guard, total, &mut |lw, m| {
                 let mut out = Vec::with_capacity(total);
                 for &(a, mask) in loads {

@@ -529,6 +529,7 @@ impl Lw {
             half: z,
             mems,
             heap_mem,
+            mems_coherent: coherent,
             res,
             fmt_table: None,
             fmt_desc_cache: HashMap::new(),

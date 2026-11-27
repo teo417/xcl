@@ -671,6 +671,22 @@ fn raw_loads_in_root_windows_are_branchless() {
         assert!(body.contains("switch i32"), "stores and atomics must keep multi-window switch:\n{dis}");
     }
 
+    // an atomic makes the windows `globallycoherent`: its loads switch too, so that no thread
+    // reads offset 0 of the windows it did not select
+    let coherent = prog(&[
+        ("GLOBAL_ATOMIC_ADD", "ENC_FLAT_GLBL", &[("VDST", 3), ("ADDR", 4), ("DATA", 5), ("SADDR", 0x7D), ("OFFSET", 0), ("GLC", 1)], None),
+        // the address in s0:s1, so that its window is not known at translation time
+        ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 6), ("ADDR", 0), ("SADDR", 0), ("OFFSET", 0)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 8), ("DATA", 6), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+    ]);
+    let cs = crate::gpu::recomp::CsInterface { threads: [32, 1, 1], user_sgprs: 2, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+    let ck = super::kernel::translate_compute(&coherent, KernelOptions { wave64: false, split: false, mem_windows: 4, sampler_base: 0 }, &cs).expect("coherent translates");
+    super::validate::validate(&ck.dxil).expect("coherent validates");
+    if let Ok(dis) = super::validate::disassemble(&ck.dxil) {
+        let body = dis.split("define void @main()").nth(1).and_then(|s| s.split("\n}\n").next()).expect("main body");
+        assert_eq!(body.matches("switch i32").count(), 3, "coherent windows: the atomic, the load and the store each switch:\n{dis}");
+    }
+
     let ps_code = prog(&[
         ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 4), ("ADDR", 0), ("SADDR", 0), ("OFFSET", 0)], None),
         ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 4), ("VSRC2", 4), ("VSRC3", 4), ("DONE", 1), ("VM", 1)], None),
